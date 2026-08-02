@@ -1,16 +1,26 @@
 class OLTogetherController extends OLPlayerController;
+
+struct RemotePlayerData
+{
+    var int CID;
+    var Pawn RemotePawn;
+    var AIController RemoteCtrl;
+    var string PlayerName;
+    var int ModelIndex;
+    var bool bTalking;
+    var int Health;
+};
+
 var OLTogetherLink ConnectionLink;
 var OLTogetherVoiceListener VoiceListener;
 var float LastVoiceControlSendTime;
 var bool bLastSentTalking;
-var Pawn RemotePawn;
 var int PlayerRole;
-var float LastStateSendTime;
 var float LastPingSendTime;
 var int RoundTripPingMs;
 var string ServerAddress, ServerPort, ConnectionState, RoomAuthToken;
 var string VoiceHost, VoicePort;
-var string LocalPlayerName, RemotePlayerName, LastSentPlayerName;
+var string LocalPlayerName, LastSentPlayerName;
 var bool bPlayerNameAnnounced;
 var float LastPlayerNameSendTime;
 var bool bChatMode;
@@ -31,31 +41,29 @@ var float SpeedrunOverlayAlpha, SpeedrunOverlayPulse;
 var bool bInStartNewGame, bStartedAtCheckpoint;
 var float DisconnectedSince, LastReconnectAttempt;
 var bool bWasConnected;
-var vector LastReceivedLoc, LastReceivedVel;
-var rotator LastReceivedRot;
-var bool bHasReceivedData;
-var bool bLastRemoteCamcorder;
-var bool bCamcorderPendingRestore;
-var int LastRemoteCamcorderState;
-var name LastMovementAnim;
-var float InterpSpeed;
-var int LastLocomotionMode, LastDoorInputDir, LastLeanInputDir, RemoteHealth;
-var bool bRemotePawnCrouched, bLocalRunning, bRemoteTalking, bMicTransmitting;
-var float AnimLockEndTime;
-var name LastCrouchLeanAnim;
+var bool bMicTransmitting;
 var config name BindSpeedrunReady, BindForceStart, BindPushToTalk, BindOpenSettings;
-var int LocalModelIndex, RemoteModelIndex;
+var int LocalModelIndex;
 var bool bModelAnnounced;
 var int LastSentModelIndex;
 var float LastModelSendTime;
 var Pawn LastModeledPawn;
-var int LastRemoteSpecialMove;
-var float JumpOverLockZ;
-var rotator JumpOverLockRot;
-var vector JumpOverLockStartPos, JumpOverLockFwd;
+var int LastSentSpecialMove;
+var int MyPlayerCid;
+var float LastStateSentTime;
+var float IdleStateSendInterval;
+var float ActiveStateSendInterval;
+
+// Door sync state tracking - continue sending after release
+var OLDoor LastActiveDoor;
+var float LastDoorSyncTime;
+var int LastDoorSyncId;
+var float LastDoorOpenRatio;
+
 const NUM_PLAYER_MODELS = 11;
 
-// Returns the display name for a player model index.
+var array<RemotePlayerData> RemotePlayers;
+
 function string GetModelName(int Idx)
 {
     switch (Idx)
@@ -75,7 +83,6 @@ function string GetModelName(int Idx)
     return "Miles Upshur";
 }
 
-// Returns the SkeletalMesh package path for a model's body.
 function string GetModelBodyPath(int Idx)
 {
     switch (Idx)
@@ -95,7 +102,6 @@ function string GetModelBodyPath(int Idx)
     return "02_Player.Pawn.Miles_beheaded";
 }
 
-// Returns the StaticMesh package path for a model's head.
 function string GetModelHeadPath(int Idx)
 {
     switch (Idx)
@@ -106,7 +112,7 @@ function string GetModelHeadPath(int Idx)
         case 3:  return "Glitchy_Boi.Head";
         case 4:  return "SurgeonPM.Meshes.Surgeon_Head_Head";
         case 5:  return "MilesPM.Meshes.Miles_Head";
-        case 6:  return "EddiePM.Meshes.Eddie_Head";
+        case 6:  return "ChrisPM.Meshes.Soldier_Body";
         case 7:  return "EddiePM.Meshes.Eddie_Head";
         case 8:  return "02_Player.Pawn.Miles_head";
         case 9:  return "02_Player.Pawn.Miles_head";
@@ -115,40 +121,21 @@ function string GetModelHeadPath(int Idx)
     return "02_Player.Pawn.Miles_head";
 }
 
-// Swaps the body (ShadowProxy) and head (HeadMesh) meshes on a hero to the
-// given model. bLocalOwner controls head visibility: the local player never
-// sees their own head (it stays hidden but still casts shadows), while the
-// remote representation shows the head so others can see it.
 function ApplyModelToHero(OLHero H, int Idx, bool bLocalOwner)
 {
     local SkeletalMesh BodyMesh;
     local StaticMesh HeadStatic;
-
-    if (H == None)
-        return;
-
+    if (H == None) return;
     BodyMesh = SkeletalMesh(DynamicLoadObject(GetModelBodyPath(Idx), class'SkeletalMesh', true));
     HeadStatic = StaticMesh(DynamicLoadObject(GetModelHeadPath(Idx), class'StaticMesh', true));
-
-    // The visible third-person body is the Mesh component; the ShadowProxy is
-    // the shadow caster. Swap both so the rendered body and its shadow match.
-    // All models share the Hero skeleton, so a plain SetSkeletalMesh keeps the
-    // animation state intact. This mirrors the OLCustomHero SDK swap exactly;
-    // forcing a skeletal/bone refresh here re-evaluates the foot/hand IK
-    // SkelControls mid-swap and distorts the limbs, so we deliberately avoid it.
     if (BodyMesh != None)
     {
-        if (H.Mesh != None)
-            H.Mesh.SetSkeletalMesh(BodyMesh);
-        if (H.ShadowProxy != None)
-            H.ShadowProxy.SetSkeletalMesh(BodyMesh);
+        if (H.Mesh != None) H.Mesh.SetSkeletalMesh(BodyMesh);
+        if (H.ShadowProxy != None) H.ShadowProxy.SetSkeletalMesh(BodyMesh);
     }
-
     if (H.HeadMesh != None && HeadStatic != None)
     {
         H.HeadMesh.SetStaticMesh(HeadStatic);
-        // Keep the head invisible to its owner but still shadow-casting; the
-        // remote representation renders the head so peers can see it.
         H.HeadMesh.SetOwnerNoSee(bLocalOwner);
         H.HeadMesh.SetHidden(bLocalOwner ? true : bHideLocalPawnDuringSpeedrun);
         H.HeadMesh.CastShadow = true;
@@ -156,47 +143,24 @@ function ApplyModelToHero(OLHero H, int Idx, bool bLocalOwner)
     }
 }
 
-// Applies the selected model to the local player's own pawn (for shadows) and
-// broadcasts the choice so peers update the remote representation.
 function ApplyLocalModel(int Idx)
 {
-    if (Idx < 0)
-        Idx = NUM_PLAYER_MODELS - 1;
-    if (Idx >= NUM_PLAYER_MODELS)
-        Idx = 0;
+    if (Idx < 0) Idx = NUM_PLAYER_MODELS - 1;
+    if (Idx >= NUM_PLAYER_MODELS) Idx = 0;
     LocalModelIndex = Idx;
-
     ApplyModelToHero(OLHero(Pawn), Idx, true);
-
-    if (Settings != None)
-    {
-        Settings.SelectedModelIndex = Idx;
-        Settings.SaveConfig();
-    }
-
+    if (Settings != None) { Settings.SelectedModelIndex = Idx; Settings.SaveConfig(); }
     bModelAnnounced = false;
     LastSentModelIndex = -1;
     if (ConnectionLink != None && ConnectionLink.bIsConnected)
         ConnectionLink.SendText("MODEL," $ Idx $ "\n");
-
     AddNotification("Model: " $ GetModelName(Idx));
 }
 
-exec function SetPlayerModel(int Idx)
-{
-    ApplyLocalModel(Idx);
-}
+exec function SetPlayerModel(int Idx) { ApplyLocalModel(Idx); }
 
-function CyclePlayerModel(int Delta)
-{
-    ApplyLocalModel(LocalModelIndex + Delta);
-}
-function string ParseUrlFallback(string Url, string Key, string Parsed)
-{
-    if (Parsed == "")
-        return GetUrlOptionValue(Url, Key);
-    return Parsed;
-}
+function CyclePlayerModel(int Delta) { ApplyLocalModel(LocalModelIndex + Delta); }
+
 function string GetUrlOptionValue(string Url, string OptionName)
 {
     local array<string> Segments;
@@ -212,18 +176,60 @@ function string GetUrlOptionValue(string Url, string OptionName)
     }
     return "";
 }
+
 function string ResolveUrl(string Url, string Key)
 {
     local string V;
     V = WorldInfo.Game.ParseOption(Url, Key);
-    if (V == "")
-        V = GetUrlOptionValue(Url, Key);
+    if (V == "") V = GetUrlOptionValue(Url, Key);
     return V;
 }
+
+function int FindOrCreateRemote(int CID)
+{
+    local int Idx;
+    local RemotePlayerData Entry;
+    local OLHero RemoteHero, MyHero;
+
+    for (Idx = 0; Idx < RemotePlayers.Length; Idx++)
+    {
+        if (RemotePlayers[Idx].CID == CID)
+            return Idx;
+    }
+
+    Entry.CID = CID;
+    Entry.PlayerName = "Player";
+    Entry.Health = 100;
+
+    if (Pawn != None)
+    {
+        Entry.RemotePawn = Spawn(class'OLTogetherRemoteHero',,, Pawn.Location, Pawn.Rotation,, true);
+        if (Entry.RemotePawn != None)
+        {
+            Entry.RemoteCtrl = Spawn(class'OLTogetherRemoteControllerV2');
+            if (Entry.RemoteCtrl != None)
+                Entry.RemoteCtrl.Possess(Entry.RemotePawn, false);
+            RemoteHero = OLHero(Entry.RemotePawn);
+            if (RemoteHero != None)
+            {
+                MyHero = OLHero(Pawn);
+                if (MyHero != None && MyHero.CameraMesh != None && RemoteHero.CameraMeshShadowProxy != None)
+                    RemoteHero.CameraMeshShadowProxy.SetSkeletalMesh(MyHero.CameraMesh.SkeletalMesh);
+                if (Entry.ModelIndex != 0)
+                    ApplyModelToHero(RemoteHero, Entry.ModelIndex, false);
+            }
+        }
+    }
+
+    RemotePlayers.AddItem(Entry);
+    return RemotePlayers.Length - 1;
+}
+
 event PostBeginPlay()
 {
     local string Url, V, PortStr;
     local int ControlPort;
+
     super.PostBeginPlay();
     Url = WorldInfo.GetLocalURL();
     V = ResolveUrl(Url, "Role");
@@ -231,6 +237,7 @@ event PostBeginPlay()
     ServerAddress = "127.0.0.1";
     ServerPort = "7777";
     LocalPlayerName = "";
+
     V = ResolveUrl(Url, "ServerIP");
     if (V != "") ServerAddress = V;
     V = ResolveUrl(Url, "ServerPort");
@@ -239,13 +246,14 @@ event PostBeginPlay()
     if (V != "") LocalPlayerName = V;
     if (LocalPlayerName == "")
         LocalPlayerName = "Player" @ (PlayerRole == 0 ? "Host" : "Client");
+
     bSpeedrunMode = (ResolveUrl(Url, "SpeedrunMode") == "1");
     V = ResolveUrl(Url, "PushToTalk");
-    if (V == "1")
-        Settings.bPushToTalk = true;
+    if (V == "1") Settings.bPushToTalk = true;
     RoomAuthToken = ResolveUrl(Url, "RoomToken");
     VoiceHost = ResolveUrl(Url, "VoiceHost");
     VoicePort = ResolveUrl(Url, "VoicePort");
+
     ConnectionState = "Connecting...";
     LastPingSendTime = 0.0;
     LastReconnectAttempt = -999.0;
@@ -258,8 +266,7 @@ event PostBeginPlay()
     ChatCaretPos = 0;
     ChatSelStart = 0;
     ChatSelEnd = 0;
-    LastLocomotionMode = 0;
-    LastDoorInputDir = 0;
+
     Settings = new(self) class'OLTogetherSettings';
     if (Settings != None)
     {
@@ -269,7 +276,9 @@ event PostBeginPlay()
         if (LocalModelIndex < 0 || LocalModelIndex >= NUM_PLAYER_MODELS)
             LocalModelIndex = 0;
     }
+
     bMicTransmitting = (Settings == None || !Settings.bPushToTalk);
+
     ConnectionLink = Spawn(class'OLTogetherLink', self);
     if (ConnectionLink != None)
     {
@@ -280,33 +289,43 @@ event PostBeginPlay()
         if (Settings != None)
             ConnectionLink.bFadeNearbyPlayers = Settings.bFadeNearbyPlayers;
     }
+
     LastVoiceControlSendTime = -999.0;
     PortStr = ResolveUrl(Url, "ControlPort");
-    if (PortStr != "")
-        ControlPort = int(PortStr);
-    else
-        ControlPort = 6700;
+    if (PortStr != "") ControlPort = int(PortStr);
+    else ControlPort = 6700;
 
     VoiceListener = Spawn(class'OLTogetherVoiceListener', self);
     if (VoiceListener != None)
         VoiceListener.Init(self, ControlPort);
+
+    IdleStateSendInterval = 0.25;
+    ActiveStateSendInterval = 0.033;
+    LastStateSentTime = 0.0;
 }
+
 function HideSpeedrunPawn()
 {
-    if (RemotePawn != None)
+    local int Idx;
+    for (Idx = 0; Idx < RemotePlayers.Length; Idx++)
     {
-        RemotePawn.SetHidden(true);
+        if (RemotePlayers[Idx].RemotePawn != None)
+            RemotePlayers[Idx].RemotePawn.SetHidden(true);
     }
     bHideLocalPawnDuringSpeedrun = true;
 }
+
 function ShowSpeedrunPawn()
 {
-    if (RemotePawn != None)
+    local int Idx;
+    for (Idx = 0; Idx < RemotePlayers.Length; Idx++)
     {
-        RemotePawn.SetHidden(false);
+        if (RemotePlayers[Idx].RemotePawn != None)
+            RemotePlayers[Idx].RemotePawn.SetHidden(false);
     }
     bHideLocalPawnDuringSpeedrun = false;
 }
+
 function ResetSpeedrunState()
 {
     bSpeedrunControlsLocked = false;
@@ -315,6 +334,7 @@ function ResetSpeedrunState()
     bSpeedrunReady = false;
     bPeerIsReady = false;
 }
+
 function ResetSpeedrunSequence()
 {
     bSpeedrunCountdownActive = false;
@@ -325,6 +345,7 @@ function ResetSpeedrunSequence()
     ShowSpeedrunPawn();
     AddNotification("GO!");
 }
+
 function CountDownTickCommon(name TickName)
 {
     local float T;
@@ -333,18 +354,17 @@ function CountDownTickCommon(name TickName)
     SpeedrunOverlayPulse += 0.06;
     SpeedrunOverlayAlpha = FMin(SpeedrunOverlayAlpha + 0.04, 0.85);
     SpeedrunCountdownValue = 5 - int(T);
-    if (SpeedrunCountdownValue < 1)
-        SpeedrunCountdownValue = 1;
+    if (SpeedrunCountdownValue < 1) SpeedrunCountdownValue = 1;
     if (T >= 5.0)
     {
         SpeedrunCountdownValue = 0;
         SpeedrunCountdownElapsed = 5.0;
         ClearTimer(TickName);
         ResetSpeedrunSequence();
-        if (ConnectionLink != None)
-            ConnectionLink.SendText("SRUN,GO\n");
+        if (ConnectionLink != None) ConnectionLink.SendText("SRUN,GO\n");
     }
 }
+
 function BeginSpeedrunCountdown(name TickName)
 {
     SpeedrunCountdownValue = 5;
@@ -353,28 +373,95 @@ function BeginSpeedrunCountdown(name TickName)
     SpeedrunOverlayPulse = 0.0;
     SetTimer(0.02, true, TickName);
 }
+
+function bool IsPawnMoving()
+{
+    local OLHero MyHero;
+    MyHero = OLHero(Pawn);
+    if (MyHero == None)
+        return false;
+    return VSize(Pawn.Velocity) > 50.0 || int(MyHero.SpecialMove) != 0;
+}
+
+function float GetCurrentSendInterval()
+{
+    if (IsPawnMoving() || LastSentSpecialMove != 0)
+        return ActiveStateSendInterval;
+    return IdleStateSendInterval;
+}
+
+function float GetDoorAnimRatio(OLHero H)
+{
+    if (H == None) return 0.0;
+    if (H.ShadowProxyDoorAnimNode == None) return 0.0;
+    return H.ShadowProxyDoorAnimNode.CurrentRatio;
+}
+
+// Door sync: identify which door the player is interacting with
+// Uses door location as stable ID (both players have same level layout)
+function int GetDoorSyncId(OLHero H)
+{
+    local int DoorId;
+    
+    if (H != None && H.ActiveDoor != None)
+    {
+        DoorId = int(H.ActiveDoor.Location.X * 7 + H.ActiveDoor.Location.Y * 13);
+        LastActiveDoor = H.ActiveDoor;
+        LastDoorSyncId = DoorId;
+        LastDoorSyncTime = WorldInfo.TimeSeconds;
+        return DoorId;
+    }
+    
+    // After release, keep sending for up to 2s so remote door opens fully
+    if (LastActiveDoor != None && WorldInfo.TimeSeconds - LastDoorSyncTime < 2.0)
+        return LastDoorSyncId;
+    
+    LastActiveDoor = None;
+    return 0;
+}
+
+function float GetDoorSyncOpenRatio(OLHero H)
+{
+    if (H != None && H.ActiveDoor != None)
+    {
+        LastDoorOpenRatio = H.ActiveDoor.OpenRatio;
+        return H.ActiveDoor.OpenRatio;
+    }
+    
+    // After release, keep reading the door's actual OpenRatio as it animates to 1.0
+    if (LastActiveDoor != None && WorldInfo.TimeSeconds - LastDoorSyncTime < 2.0)
+    {
+        LastDoorOpenRatio = LastActiveDoor.OpenRatio;
+        return LastActiveDoor.OpenRatio;
+    }
+    
+    return -1.0;
+}
+
 event PlayerTick(float DeltaTime)
 {
     local string Packet;
-    local vector ProjectedLoc, EasedLoc, VelForAnim;
-    local rotator EasedRot;
-    local AIController SpawnedAI;
     local OLHero RemoteHero, MyHero;
     local int DoorState, LeanState, ExtraState, ExtraKind;
-    local float GapToRemote;
-    local bool bFadeNow, bJumpingOver;
+    local float GapToRemote, SendInterval;
+    local bool bFadeNow;
+    local int Idx;
+
     super.PlayerTick(DeltaTime);
+
     if (bSpeedrunControlsLocked)
     {
         if (bIgnoreMoveInput == 0) IgnoreMoveInput(true);
         if (bIgnoreLookInput == 0) IgnoreLookInput(true);
     }
+
     if (ConnectionLink != None && !ConnectionLink.bIsConnected && Settings != None && Settings.bAutoReconnect
         && WorldInfo.TimeSeconds - LastReconnectAttempt > FMax(1.0, Settings.ReconnectDelay))
     {
         LastReconnectAttempt = WorldInfo.TimeSeconds;
         ConnectionLink.Reconnect();
     }
+
     if (ConnectionLink != None && ConnectionLink.bIsConnected)
     {
         if (!bPlayerNameAnnounced || LocalPlayerName != LastSentPlayerName || WorldInfo.TimeSeconds - LastPlayerNameSendTime > 1.0)
@@ -384,6 +471,7 @@ event PlayerTick(float DeltaTime)
             LastSentPlayerName = LocalPlayerName;
             LastPlayerNameSendTime = WorldInfo.TimeSeconds;
         }
+
         if (!bModelAnnounced || LocalModelIndex != LastSentModelIndex || WorldInfo.TimeSeconds - LastModelSendTime > 1.0)
         {
             ConnectionLink.SendText("MODEL," $ LocalModelIndex $ "\n");
@@ -391,224 +479,177 @@ event PlayerTick(float DeltaTime)
             LastSentModelIndex = LocalModelIndex;
             LastModelSendTime = WorldInfo.TimeSeconds;
         }
+
         if (WorldInfo.TimeSeconds - LastPingSendTime > 1.0)
         {
             LastPingSendTime = WorldInfo.TimeSeconds;
             ConnectionLink.SendText("PING," $ string(int(WorldInfo.TimeSeconds * 1000.0)) $ "\n");
         }
+
         if (bMicTransmitting != bLastSentTalking)
         {
             bLastSentTalking = bMicTransmitting;
             ConnectionLink.SendText("TALK," $ int(bMicTransmitting) $ "\n");
         }
     }
-    if (ConnectionLink != None && ConnectionLink.bIsConnected && Pawn != None && WorldInfo.TimeSeconds - LastStateSendTime > 0.05)
+
+    if (ConnectionLink != None && ConnectionLink.bIsConnected && Pawn != None)
     {
-        LastStateSendTime = WorldInfo.TimeSeconds;
         MyHero = OLHero(Pawn);
-        DoorState = 0;
-        if (MyHero != None)
+        SendInterval = GetCurrentSendInterval();
+
+        if (MyHero != None && int(MyHero.SpecialMove) != LastSentSpecialMove)
         {
-            switch (int(MyHero.SpecialMove))
+            if (int(MyHero.SpecialMove) != 0)
+                ConnectionLink.SendText("SPECIAL_S," $ int(MyHero.SpecialMove) $ "," $ int(VSize(Pawn.Velocity) > 300.0) $ "\n");
+            else
+                ConnectionLink.SendText("SPECIAL_E\n");
+            LastSentSpecialMove = int(MyHero.SpecialMove);
+        }
+        
+        if (WorldInfo.TimeSeconds - LastStateSentTime >= SendInterval)
+        {
+            LastStateSentTime = WorldInfo.TimeSeconds;
+
+            DoorState = 0;
+            if (MyHero != None)
             {
-                case 28: case 29: case 30: case 31: case 32:
-                    DoorState = int(MyHero.DoorOpeningType); break;
-                case 33: case 34:
-                    DoorState = int(MyHero.DoorClosingType); break;
+                switch (int(MyHero.SpecialMove))
+                {
+                    case 28: case 29: case 30: case 31: case 32:
+                        DoorState = int(MyHero.DoorOpeningType); break;
+                    case 33: case 34:
+                        DoorState = int(MyHero.DoorClosingType); break;
+                }
+                if (MyHero.ActiveDoor != None && (MyHero.SpecialMove >= 28 && MyHero.SpecialMove <= 34))
+                {
+                    `log("[DOOR_HOST] SM:" @ int(MyHero.SpecialMove) @ "DoorState:" @ DoorState @ "RevDir:" @ MyHero.ActiveDoor.bReverseDirection @ "DoorName:" @ MyHero.ActiveDoor @ "Time:" @ WorldInfo.TimeSeconds);
+                }
+            }
+
+            LeanState = (bLeanInputLeft != 0) ? 1 : (bLeanInputRight != 0) ? 2 : 0;
+            ExtraState = 0;
+            ExtraKind = 0;
+            if (MyHero != None)
+            {
+                ExtraState = int(MyHero.bLeftAnim);
+                ExtraKind = int(MyHero.ActiveLedgeTransitionType);
+            }
+
+            Packet = "LOC,"
+                $ WorldInfo.TimeSeconds $ ","
+                $ Pawn.Location.X $ "," $ Pawn.Location.Y $ "," $ Pawn.Location.Z $ ","
+                $ Rotation.Pitch $ "," $ Rotation.Yaw $ ","
+                $ Pawn.Velocity.X $ "," $ Pawn.Velocity.Y $ "," $ Pawn.Velocity.Z $ ","
+                $ int(Pawn.bIsCrouched) $ ","
+                $ (MyHero != None ? int(MyHero.bCamcorderDesired) : 0) $ ","
+                $ (MyHero != None ? int(MyHero.CamcorderState) : 0) $ ","
+                $ (MyHero != None ? int(MyHero.LocomotionMode) : 0) $ ","
+                $ (MyHero != None ? int(MyHero.SpecialMove) : 0) $ ","
+                $ DoorState $ "," $ LeanState $ "," $ ExtraState $ "," $ ExtraKind $ ","
+                $ (MyHero != None ? int(MyHero.PreciseHealth) : 100) $ ","
+                $ (MyHero != None ? int(MyHero.bRunningTraversalMove) : 0) $ ","
+                $ (MyHero != None ? int(MyHero.bPlayingSpecialMoveAnim) : 0) $ ","
+                $ GetDoorAnimRatio(MyHero) $ ","
+                $ GetDoorSyncId(MyHero) $ "," $ GetDoorSyncOpenRatio(MyHero);
+
+            ConnectionLink.SendText(Packet $ "\n");
+        }
+
+        if (VoiceListener != None && VoiceListener.bClientConnected && Pawn != None && WorldInfo.TimeSeconds - LastVoiceControlSendTime > 0.05)
+        {
+            LastVoiceControlSendTime = WorldInfo.TimeSeconds;
+            VoiceListener.SendControl(
+                "POS,"
+                $ Pawn.Location.X $ ","
+                $ Pawn.Location.Y $ ","
+                $ Pawn.Location.Z $ ","
+                $ (Rotation.Yaw * (360.0 / 65536.0))
+            );
+            VoiceListener.SendControl("PTT," $ int(bMicTransmitting));
+            if (Settings != None)
+            {
+                VoiceListener.SendControl("PROX," $ int(Settings.VoiceProximityNear) $ "," $ int(Settings.VoiceProximityFar));
+                VoiceListener.SendControl("MUTE," $ int(Settings.bMuteEveryone || Settings.bMuteRemotePlayer) $ "," $ int(Settings.bMuteEveryone));
             }
         }
-        LeanState = (bLeanInputLeft != 0) ? 1 : (bLeanInputRight != 0) ? 2 : 0;
-        ExtraState = 0;
-        ExtraKind = 0;
-        if (MyHero != None)
-        {
-            ExtraState = int(MyHero.bLeftAnim);
-            ExtraKind = int(MyHero.ActiveLedgeTransitionType);
-        }
-        Packet = "LOC,"
-            $ Pawn.Location.X $ "," $ Pawn.Location.Y $ "," $ Pawn.Location.Z $ ","
-            $ Rotation.Pitch $ "," $ Rotation.Yaw $ ","
-            $ Pawn.Velocity.X $ "," $ Pawn.Velocity.Y $ "," $ Pawn.Velocity.Z $ ","
-            $ int(Pawn.bIsCrouched) $ ","
-            $ (MyHero != None ? int(MyHero.bCamcorderDesired) : 0) $ ","
-            $ (MyHero != None ? int(MyHero.CamcorderState) : 0) $ ","
-            $ (MyHero != None ? int(MyHero.LocomotionMode) : 0) $ ","
-            $ (MyHero != None ? int(MyHero.SpecialMove) : 0) $ ","
-            $ DoorState $ "," $ LeanState $ "," $ ExtraState $ "," $ ExtraKind $ ","
-            $ (MyHero != None ? int(MyHero.PreciseHealth) : 100);
-        ConnectionLink.SendText(Packet $ "\n");
     }
-        if (VoiceListener != None && VoiceListener.bClientConnected && Pawn != None && WorldInfo.TimeSeconds - LastVoiceControlSendTime > 0.05)
-    {
-        LastVoiceControlSendTime = WorldInfo.TimeSeconds;
-        // Full 3D position + camera yaw (in degrees) for 3D spatial audio.
-        // UE3 rotator Yaw is in unreal-units (65536 = 360 deg); convert to degrees.
-        VoiceListener.SendControl(
-            "POS,"
-            $ Pawn.Location.X $ ","
-            $ Pawn.Location.Y $ ","
-            $ Pawn.Location.Z $ ","
-            $ (Rotation.Yaw * (360.0 / 65536.0))
-        );
-        VoiceListener.SendControl("PTT," $ int(bMicTransmitting));
-        if (Settings != None)
-        {
-            VoiceListener.SendControl("PROX," $ int(Settings.VoiceProximityNear) $ "," $ int(Settings.VoiceProximityFar));
-            VoiceListener.SendControl("MUTE," $ int(Settings.bMuteEveryone || Settings.bMuteRemotePlayer) $ "," $ int(Settings.bMuteEveryone));
-        }
-    }
+
     if (Pawn != None && Pawn != LastModeledPawn)
     {
         LastModeledPawn = Pawn;
         if (LocalModelIndex != 0)
             ApplyModelToHero(OLHero(Pawn), LocalModelIndex, true);
     }
-    if (RemotePawn == None && Pawn != None)
+
+    for (Idx = 0; Idx < RemotePlayers.Length; Idx++)
     {
-        RemotePawn = Spawn(class'OLTogetherHero',,, Pawn.Location, Pawn.Rotation,, true);
-        if (RemotePawn != None)
+        if (RemotePlayers[Idx].RemotePawn == None && Pawn != None)
         {
-            RemotePawn.SetPhysics(PHYS_Walking);
-            RemotePawn.SetCollision(false, false, false);
-            RemotePawn.bCollideWorld = false;
-            SpawnedAI = Spawn(class'AIController');
-            if (SpawnedAI != None)
-                SpawnedAI.Possess(RemotePawn, false);
-            RemoteHero = OLHero(RemotePawn);
-            if (RemoteHero != None)
+            RemotePlayers[Idx].RemotePawn = Spawn(class'OLTogetherRemoteHero',,, Pawn.Location, Pawn.Rotation,, true);
+            if (RemotePlayers[Idx].RemotePawn != None)
             {
-                if (RemoteHero.Mesh != None)
+                RemotePlayers[Idx].RemoteCtrl = Spawn(class'OLTogetherRemoteControllerV2');
+                if (RemotePlayers[Idx].RemoteCtrl != None)
+                    RemotePlayers[Idx].RemoteCtrl.Possess(RemotePlayers[Idx].RemotePawn, false);
+                RemoteHero = OLHero(RemotePlayers[Idx].RemotePawn);
+                if (RemoteHero != None)
                 {
-                    RemoteHero.Mesh.SetHidden(true);
-                    RemoteHero.Mesh.SetOwnerNoSee(true);
-                    RemoteHero.Mesh.bUpdateSkelWhenNotRendered = true;
-                    RemoteHero.Mesh.bTickAnimNodesWhenNotRendered = true;
-                    // Animations are cosmetic only; the pawn's position is driven
-                    // entirely by the networked location. Ignore any root motion
-                    // so anim clips can't shove the pawn around and stutter.
-                    RemoteHero.Mesh.RootMotionMode = RMM_Ignore;
-                }
-                if (RemoteHero.ShadowProxy != None)
-                {
-                    RemoteHero.ShadowProxy.SetOwnerNoSee(false);
-                    RemoteHero.ShadowProxy.SetHidden(bHideLocalPawnDuringSpeedrun);
-                    RemoteHero.ShadowProxy.bUpdateSkelWhenNotRendered = true;
-                    RemoteHero.ShadowProxy.bTickAnimNodesWhenNotRendered = true;
-                    RemoteHero.ShadowProxy.RootMotionMode = RMM_Ignore;
-                }
-                if (RemoteHero.HeadMesh != None)
-                {
-                    RemoteHero.HeadMesh.SetHidden(bHideLocalPawnDuringSpeedrun);
-                    RemoteHero.HeadMesh.SetOwnerNoSee(false);
-                }
-                if (RemoteHero.CameraMeshShadowProxy != None)
-                {
-                    RemoteHero.CameraMeshShadowProxy.SetHidden(true);
                     MyHero = OLHero(Pawn);
-                    if (MyHero != None && MyHero.CameraMesh != None)
+                    if (MyHero != None && MyHero.CameraMesh != None && RemoteHero.CameraMeshShadowProxy != None)
                         RemoteHero.CameraMeshShadowProxy.SetSkeletalMesh(MyHero.CameraMesh.SkeletalMesh);
+                    if (RemotePlayers[Idx].ModelIndex != 0)
+                        ApplyModelToHero(RemoteHero, RemotePlayers[Idx].ModelIndex, false);
                 }
-                if (RemoteModelIndex != 0)
-                    ApplyModelToHero(RemoteHero, RemoteModelIndex, false);
             }
         }
-    }
-    if (RemotePawn != None && bHasReceivedData)
-    {
-        // Movement is driven entirely by the networked position (interpolated),
-        // never by animation root motion. During jump-over special moves (SM 5 and 6)
-        // the sender's velocity spikes from its root-motion move, so dead-reckoning
-        // by velocity overshoots and then snaps back. For those moves we skip the
-        // velocity extrapolation entirely and just ease smoothly toward the actual
-        // received position. Every other mode dead-reckons then eases as before.
-        bJumpingOver = (LastLocomotionMode == 2 && (LastRemoteSpecialMove == 5 || LastRemoteSpecialMove == 6));
-        if (bJumpingOver)
-        {
-            ProjectedLoc = LastReceivedLoc - JumpOverLockStartPos;
-            ProjectedLoc = JumpOverLockStartPos + JumpOverLockFwd * (ProjectedLoc.X * JumpOverLockFwd.X + ProjectedLoc.Y * JumpOverLockFwd.Y);
-            ProjectedLoc.Z = LastReceivedLoc.Z;
-            EasedLoc = VInterpTo(RemotePawn.Location, ProjectedLoc, DeltaTime, InterpSpeed);
-        }
-        else
-        {
-            ProjectedLoc = LastReceivedLoc;
-            ProjectedLoc.X += LastReceivedVel.X * DeltaTime;
-            ProjectedLoc.Y += LastReceivedVel.Y * DeltaTime;
-            ProjectedLoc.Z += LastReceivedVel.Z * DeltaTime;
-            LastReceivedLoc = ProjectedLoc;
-            EasedLoc = VInterpTo(RemotePawn.Location, ProjectedLoc, DeltaTime, InterpSpeed);
-        }
-        RemotePawn.SetLocation(EasedLoc);
-        // During a jump-over the sender's yaw arrives jumpy at 20 Hz and the AI
-        // walking physics tries to steer the pawn toward its (spiked) velocity, so
-        // the body spins in place. Freeze the facing at the rotation captured when
-        // the move started and zero the drive velocity so nothing turns the pawn.
-        if (bJumpingOver)
-        {
-            RemotePawn.SetRotation(JumpOverLockRot);
-            RemotePawn.Velocity = vect(0,0,0);
-            RemotePawn.Acceleration = vect(0,0,0);
-        }
-        else
-        {
-            EasedRot = RInterpTo(RemotePawn.Rotation, LastReceivedRot, DeltaTime, InterpSpeed);
-            EasedRot.Pitch = 0;
-            RemotePawn.SetRotation(EasedRot);
-            VelForAnim = LastReceivedVel;
-            if (LastLocomotionMode != 3)
-                VelForAnim.Z = 0;
-            RemotePawn.Velocity = VelForAnim;
-            RemotePawn.Acceleration = VelForAnim;
-        }
-        UpdateDummyMovementAnim();
-        RemoteHero = OLHero(RemotePawn);
-        if (RemoteHero != None)
-        {
-            if (LastLocomotionMode == 0 && LastLeanInputDir != 0 && (bRemotePawnCrouched || VSize(VelForAnim) < 50.0))
-                RemoteHero.CurrentLean = (LastLeanInputDir == 1) ? -1.0 : 1.0;
-            else
-                RemoteHero.CurrentLean = 0.0;
-        }
-        if (RemoteHero != None && Pawn != None)
+
+        if (RemotePlayers[Idx].RemotePawn != None)
         {
             if (bHideLocalPawnDuringSpeedrun)
             {
-                RemotePawn.SetHidden(true);
+                RemotePlayers[Idx].RemotePawn.SetHidden(true);
             }
             else if (ConnectionLink != None && ConnectionLink.bFadeNearbyPlayers)
             {
-                GapToRemote = VSize(EasedLoc - Pawn.Location);
+                GapToRemote = VSize(RemotePlayers[Idx].RemotePawn.Location - Pawn.Location);
                 bFadeNow = (GapToRemote < ConnectionLink.NearbyFadeDistance);
-                if (!bFadeNow && RemoteHero.ShadowProxy != None && RemoteHero.ShadowProxy.HiddenGame)
+                RemoteHero = OLHero(RemotePlayers[Idx].RemotePawn);
+                if (!bFadeNow && RemoteHero != None && RemoteHero.ShadowProxy != None && RemoteHero.ShadowProxy.HiddenGame)
                     bFadeNow = (GapToRemote < ConnectionLink.NearbyFadeDistance + ConnectionLink.NearbyFadeHysteresis);
-                if (RemoteHero.ShadowProxy != None)
-                    RemoteHero.ShadowProxy.SetHidden(bFadeNow);
-                if (RemoteHero.HeadMesh != None)
-                    RemoteHero.HeadMesh.SetHidden(bFadeNow);
-                if (bFadeNow && RemoteHero.CameraMeshShadowProxy != None)
-                    RemoteHero.CameraMeshShadowProxy.SetHidden(true);
+                if (RemoteHero != None)
+                {
+                    if (RemoteHero.ShadowProxy != None)
+                        RemoteHero.ShadowProxy.SetHidden(bFadeNow);
+                    if (RemoteHero.HeadMesh != None)
+                        RemoteHero.HeadMesh.SetHidden(bFadeNow);
+                    if (bFadeNow && RemoteHero.CameraMeshShadowProxy != None)
+                        RemoteHero.CameraMeshShadowProxy.SetHidden(true);
+                }
             }
         }
     }
 }
+
 exec function SetServerAddress(string NewIP)
 {
     if (NewIP == "") return;
     ServerAddress = NewIP;
-    if (ConnectionLink != None)
-        ConnectionLink.SetServer(ServerAddress, ServerPort);
+    if (ConnectionLink != None) ConnectionLink.SetServer(ServerAddress, ServerPort);
 }
+
 exec function SetServerPort(string NewPort)
 {
     if (NewPort == "") return;
     ServerPort = NewPort;
-    if (ConnectionLink != None)
-        ConnectionLink.SetServer(ServerAddress, ServerPort);
+    if (ConnectionLink != None) ConnectionLink.SetServer(ServerAddress, ServerPort);
 }
+
 exec function ConnectToServer()
 {
     if (ConnectionLink != None) ConnectionLink.Reconnect();
 }
+
 exec function ToggleMouseSmoothing()
 {
     if (PlayerInput != None)
@@ -618,6 +659,7 @@ exec function ToggleMouseSmoothing()
         AddNotification(PlayerInput.bEnableMouseSmoothing ? "Mouse Smoothing: On" : "Mouse Smoothing: Off");
     }
 }
+
 exec function SetMouseSmoothing(bool bEnable)
 {
     if (PlayerInput != None)
@@ -626,47 +668,47 @@ exec function SetMouseSmoothing(bool bEnable)
         PlayerInput.SaveConfig();
     }
 }
+
 function ApplySettings()
 {
     if (Settings == None) return;
-    if (PlayerInput != None)
-        PlayerInput.SaveConfig();
-    if (ConnectionLink != None)
-        ConnectionLink.bFadeNearbyPlayers = Settings.bFadeNearbyPlayers;
+    if (PlayerInput != None) PlayerInput.SaveConfig();
+    if (ConnectionLink != None) ConnectionLink.bFadeNearbyPlayers = Settings.bFadeNearbyPlayers;
 }
+
 Function LoadCheckpoint(string Checkpoint)
 {
     StartNewGameAtCheckpoint(Checkpoint, false);
 }
+
 function SafeLoadCheckpoint(string Checkpoint)
 {
-    if (Checkpoint != "Admin_Gates")
-        Checkpoint = "Admin_Gates";
+    if (Checkpoint != "Admin_Gates") Checkpoint = "Admin_Gates";
     LoadCheckpoint(Checkpoint);
 }
+
 exec function ToggleSettingsMenu()
 {
     local OLTogetherHUD H;
     if (bChatMode) return;
     H = OLTogetherHUD(HUD);
-    if (H != None)
-    {
-        H.ToggleSettingsMenu();
-        bSettingsMenuOpen = H.bSettingsOpen;
-    }
+    if (H != None) { H.ToggleSettingsMenu(); bSettingsMenuOpen = H.bSettingsOpen; }
 }
+
 function bool IsSettingsMenuOpen()
 {
     local OLTogetherHUD H;
     H = OLTogetherHUD(HUD);
     return H != None && H.bSettingsOpen;
 }
+
 function SettingsMenuClick()
 {
     local OLTogetherHUD H;
     H = OLTogetherHUD(HUD);
     if (H != None) H.SettingsMenuClick(self);
 }
+
 function SettingsMenuInput(name Key)
 {
     local OLTogetherHUD H;
@@ -687,6 +729,7 @@ function SettingsMenuInput(name Key)
             break;
     }
 }
+
 exec function ForceStartSpeedrun()
 {
     if (!bSpeedrunMode || PlayerRole != 0) return;
@@ -695,6 +738,7 @@ exec function ForceStartSpeedrun()
     BeginSpeedrunSequence();
     ToggleSettingsMenu();
 }
+
 exec function ToggleSpeedrunReady()
 {
     if (!bSpeedrunMode || bSpeedrunSequenceActive) return;
@@ -705,9 +749,9 @@ exec function ToggleSpeedrunReady()
         AddNotification("Ready - waiting for others...");
         if (bPeerIsReady) BeginSpeedrunSequence();
     }
-    else
-        ConnectionLink.SendText("SRUN,UNREADY\n");
+    else ConnectionLink.SendText("SRUN,UNREADY\n");
 }
+
 function BeginSpeedrunSequence()
 {
     local OLHero HeroRef;
@@ -726,18 +770,18 @@ function BeginSpeedrunSequence()
         SpeedrunLockRotation = HeroRef.Rotation;
     }
     AddNotification("Starting race...");
-    if (PlayerRole == 0 && ConnectionLink != None)
-        ConnectionLink.SendText("SRUN,SEQ\n");
+    if (PlayerRole == 0 && ConnectionLink != None) ConnectionLink.SendText("SRUN,SEQ\n");
     SafeLoadCheckpoint("Admin_Gates");
     SetTimer(3.0, false, 'SpeedrunSequenceTeleport');
 }
+
 function SpeedrunSequenceTeleport()
 {
     HideSpeedrunPawn();
-    if (PlayerRole == 0 && ConnectionLink != None)
-        ConnectionLink.SendText("SRUN,TP\n");
+    if (PlayerRole == 0 && ConnectionLink != None) ConnectionLink.SendText("SRUN,TP\n");
     SetTimer(1.5, false, 'SpeedrunSequenceStartCountdown');
 }
+
 function SpeedrunSequenceStartCountdown()
 {
     bSpeedrunControlsLocked = false;
@@ -746,25 +790,12 @@ function SpeedrunSequenceStartCountdown()
     bSpeedrunControlsLocked = true;
     BeginSpeedrunCountdown('SpeedrunCountdownTick');
 }
+
 function SpeedrunCountdownTick()
 {
-    local float T;
-    T = WorldInfo.TimeSeconds - SpeedrunCountdownStartTime;
-    SpeedrunCountdownElapsed = T;
-    SpeedrunOverlayPulse += 0.06;
-    SpeedrunOverlayAlpha = FMin(SpeedrunOverlayAlpha + 0.04, 0.85);
-    SpeedrunCountdownValue = 5 - int(T);
-    if (SpeedrunCountdownValue < 1) SpeedrunCountdownValue = 1;
-    if (T >= 5.0)
-    {
-        SpeedrunCountdownValue = 0;
-        SpeedrunCountdownElapsed = 5.0;
-        ClearTimer('SpeedrunCountdownTick');
-        ResetSpeedrunSequence();
-        if (ConnectionLink != None)
-            ConnectionLink.SendText("SRUN,GO\n");
-    }
+    CountDownTickCommon('SpeedrunCountdownTick');
 }
+
 function BeginSpeedrunSequenceClient()
 {
     local OLHero HeroRef;
@@ -776,7 +807,8 @@ function BeginSpeedrunSequenceClient()
     IgnoreMoveInput(true);
     IgnoreLookInput(true);
     bSpeedrunControlsLocked = true;
-    HeroRef = OLHero(RemotePawn);
+    if (RemotePlayers.Length > 0 && RemotePlayers[0].RemotePawn != None)
+        HeroRef = OLHero(RemotePlayers[0].RemotePawn);
     if (HeroRef != None)
     {
         SpeedrunLockLocation = HeroRef.Location;
@@ -784,38 +816,23 @@ function BeginSpeedrunSequenceClient()
     }
     AddNotification("Starting race...");
 }
+
 function SpeedrunSequenceTeleportClient()
 {
     HideSpeedrunPawn();
     SetTimer(1.5, false, 'SpeedrunSequenceStartCountdownClient');
 }
+
 function SpeedrunSequenceStartCountdownClient()
 {
     BeginSpeedrunCountdown('SpeedrunCountdownTickClient');
 }
+
 function SpeedrunCountdownTickClient()
 {
-    local float T;
-    T = WorldInfo.TimeSeconds - SpeedrunCountdownStartTime;
-    SpeedrunCountdownElapsed = T;
-    SpeedrunOverlayPulse += 0.06;
-    SpeedrunOverlayAlpha = FMin(SpeedrunOverlayAlpha + 0.04, 0.85);
-    SpeedrunCountdownValue = 5 - int(T);
-    if (SpeedrunCountdownValue < 1) SpeedrunCountdownValue = 1;
-    if (T >= 5.0)
-    {
-        SpeedrunCountdownValue = 0;
-        SpeedrunCountdownElapsed = 5.0;
-        ClearTimer('SpeedrunCountdownTickClient');
-        bSpeedrunCountdownActive = false;
-        bSpeedrunSequenceActive = false;
-        SpeedrunStartTime = WorldInfo.TimeSeconds;
-        SpeedrunCountdownStartTime = 0.0;
-        ResetSpeedrunState();
-        ShowSpeedrunPawn();
-        AddNotification("GO!");
-    }
+    CountDownTickCommon('SpeedrunCountdownTickClient');
 }
+
 function SpeedrunRemoteGo()
 {
     ClearTimer('SpeedrunCountdownTickClient');
@@ -827,6 +844,7 @@ function SpeedrunRemoteGo()
     ShowSpeedrunPawn();
     AddNotification("GO!");
 }
+
 function CheckSpeedrunCheckpoint(name CheckpointName)
 {
     local string Label;
@@ -840,6 +858,7 @@ function CheckSpeedrunCheckpoint(name CheckpointName)
         AddNotification("Finished! Time: " $ int(FT) $ "." $ int((FT % 1.0) * 100));
     }
 }
+
 exec function SetLocalPlayerName(string NewName)
 {
     if (NewName == "") return;
@@ -849,6 +868,7 @@ exec function SetLocalPlayerName(string NewName)
     if (ConnectionLink != None && ConnectionLink.bIsConnected)
         ConnectionLink.SendText("NAME," $ LocalPlayerName $ "\n");
 }
+
 exec function Chat(string Message)
 {
     if (Message == "") return;
@@ -857,9 +877,9 @@ exec function Chat(string Message)
         ConnectionLink.SendText("CHAT," $ LocalPlayerName $ ": " $ Message $ "\n");
         AddChatLine("You: " $ Message);
     }
-    else
-        AddChatLine("Chat failed - not connected.");
+    else AddChatLine("Chat failed - not connected.");
 }
+
 function AddChatLine(string Msg)
 {
     local OLTogetherHUD H;
@@ -867,6 +887,7 @@ function AddChatLine(string Msg)
     H = OLTogetherHUD(HUD);
     if (H != None) H.AddChatLine(Msg);
 }
+
 function AddNotification(string Msg)
 {
     local OLTogetherHUD H;
@@ -874,158 +895,60 @@ function AddNotification(string Msg)
     H = OLTogetherHUD(HUD);
     if (H != None) H.AddNotification(Msg);
 }
-function PlayBodyAnim(name AnimName, float BlendIn, float BlendOut, bool bLoop, float Rate, optional bool bRootMotion = true)
-{
-    local OLHero TH;
-    TH = OLHero(RemotePawn);
-    if (TH == None) return;
-    if (TH.ShadowProxyFullBodyAnimSlot != None)
-        TH.ShadowProxyFullBodyAnimSlot.PlayCustomAnim(AnimName, Rate, BlendIn, BlendOut, bLoop, bRootMotion);
-    else if (TH.ShadowProxy != None)
-        TH.ShadowProxy.PlayAnim(AnimName, Rate, bLoop, bRootMotion, BlendIn);
-}
-function StopBodyAnim(float BlendOut)
-{
-    local OLHero TH;
-    TH = OLHero(RemotePawn);
-    if (TH != None && TH.ShadowProxyFullBodyAnimSlot != None)
-        TH.ShadowProxyFullBodyAnimSlot.StopCustomAnim(BlendOut);
-}
-function UpdateDummyMovementAnim()
-{
-    local OLHero RH;
-    local vector FV, FD, SD, VD;
-    local float FS, FDt, SDt, YR;
-    local name AP;
-    RH = OLHero(RemotePawn);
-    if (RH == None || RH.ShadowProxy == None) return;
-    if (WorldInfo.TimeSeconds < AnimLockEndTime) return;
-    if (LastLocomotionMode == 4)
-    {
-        FV = LastReceivedVel;
-        FV.Z = 0;
-        FS = VSize(FV);
-        if (FS < 20.0)
-        {
-            if (LastMovementAnim != 'None')
-            {
-                LastMovementAnim = 'None';
-                StopBodyAnim(0.15);
-            }
-            return;
-        }
-        YR = RemotePawn.Rotation.Yaw * (3.1415927 / 180.0);
-        SD.X = Cos(YR + 1.5707963); SD.Y = Sin(YR + 1.5707963); SD.Z = 0;
-        VD = FV / FS;
-        SDt = (VD.X * SD.X) + (VD.Y * SD.Y);
-        AP = (SDt > 0.0) ? 'player_ledge_move_right_90_inside' : 'player_ledge_move_left_90_inside';
-        if (AP != LastMovementAnim)
-        {
-            LastMovementAnim = AP;
-            PlayBodyAnim(AP, 0.2, 0.0, true, 1.0);
-        }
-        return;
-    }
-    if (LastLocomotionMode != 0) return;
-    if (!bRemotePawnCrouched)
-    {
-        if (LastMovementAnim != 'None')
-        {
-            LastMovementAnim = 'None';
-            StopBodyAnim(0.15);
-        }
-        RH.LocomotionMode = LM_Walk;
-        return;
-    }
-    FV = LastReceivedVel;
-    FV.Z = 0;
-    FS = VSize(FV);
-    if (FS < 20.0)
-    {
-        AP = (LastLeanInputDir == 1) ? 'player_crouch_lean_left' : (LastLeanInputDir == 2) ? 'player_crouch_lean_right' : 'player_crouch_idle';
-    }
-    else
-    {
-        YR = RemotePawn.Rotation.Yaw * (3.1415927 / 180.0);
-        FD.X = Cos(YR); FD.Y = Sin(YR); FD.Z = 0;
-        SD.X = Cos(YR + 1.5707963); SD.Y = Sin(YR + 1.5707963); SD.Z = 0;
-        VD = FV / FS;
-        FDt = (VD.X * FD.X) + (VD.Y * FD.Y);
-        SDt = (VD.X * SD.X) + (VD.Y * SD.Y);
-        AP = (FDt > 0.7) ? 'player_crouch_forward' : (FDt < -0.7) ? 'player_crouch_backward' : (SDt > 0.0) ? 'player_crouch_strafe_right' : 'player_crouch_strafe_left';
-    }
-    if (AP != LastMovementAnim)
-    {
-        LastMovementAnim = AP;
-        PlayBodyAnim(AP, 0.2, 0.0, true, 1.0);
-    }
-}
-function HideCamcorderProp()
-{
-    local OLHero RH;
-    RH = OLHero(RemotePawn);
-    if (RH != None && RH.CameraMeshShadowProxy != None)
-        RH.CameraMeshShadowProxy.SetHidden(true);
-}
-function PlayCamcorderIdleAnim()
-{
-    local OLHero RH;
-    RH = OLHero(RemotePawn);
-    if (RH != None && RH.ShadowProxyRightArmAnimSlot != None)
-        RH.ShadowProxyRightArmAnimSlot.PlayCustomAnim(
-            bRemotePawnCrouched ? 'player_crouch_camcorder_idle' : 'player_camcorder_idle', 1.0, 0.05, -1.0, true, true);
-}
-function FinishInactiveReload()
-{
-    local OLHero RH;
-    RH = OLHero(RemotePawn);
-    if (RH == None) return;
-    if (RH.CameraMeshShadowProxy != None)
-        RH.CameraMeshShadowProxy.SetHidden(true);
-    if (RH.ShadowProxyRightArmAnimSlot != None)
-        RH.ShadowProxyRightArmAnimSlot.StopCustomAnim(0.15);
-    if (RH.ShadowProxyLeftArmAnimSlot != None)
-        RH.ShadowProxyLeftArmAnimSlot.StopCustomAnim(0.15);
-}
-function RestoreCamcorderAfterLedge()
-{
-    local OLHero RH;
-    if (!bCamcorderPendingRestore) return;
-    bCamcorderPendingRestore = false;
-    RH = OLHero(RemotePawn);
-    if (RH == None) return;
-    if (LastLocomotionMode == 3 || LastLocomotionMode == 4) return;
-    if (!bLastRemoteCamcorder) return;
-    if (RH.CameraMeshShadowProxy != None)
-        RH.CameraMeshShadowProxy.SetHidden(false);
-    PlayCamcorderIdleAnim();
-}
+
 function OnReceiveData(string Data)
 {
     local array<string> F;
     local vector IL, IV;
     local rotator IR;
-    local bool BC, CC, bWasJumpingOver, bJumpingOverNow;
-    local int CS, LM, PL, SM, DD, LD, ED, ET, HP;
-    local float SMs, NMs;
-    local OLHero RH;
+    local bool BC, CC, bRunning, bPlayingAnim;
+    local int CS, LM, SM, DD, LD, ED, ET, HP, FromCid, RIdx;
+    local float SMs, NMs, TS, DoorRatio, DoorSyncOpenRatio;
+    local int DoorSyncId;
+    local OLTogetherRemoteControllerV2 RemoteV2;
+
+    RIdx = -1;
+
+    if (Left(Data, 9) == "YOUR_CID,")
+    {
+        MyPlayerCid = int(Right(Data, Len(Data) - 9));
+        `log("[OLTogether] YOUR_CID=" $ MyPlayerCid);
+        return;
+    }
+
+    if (Left(Data, 5) == "FROM,")
+    {
+        F = SplitString(Data, ",", true);
+        if (F.Length < 3) return;
+        FromCid = int(F[1]);
+        Data = Right(Data, Len(Data) - (Len(F[0]) + Len(F[1]) + 2));
+        RIdx = FindOrCreateRemote(FromCid);
+    }
+
     if (Left(Data, 5) == "CHAT,") { AddChatLine(Right(Data, Len(Data) - 5)); return; }
+
     if (Left(Data, 6) == "MODEL,")
     {
         F = SplitString(Data, ",", true);
-        if (F.Length >= 2)
+        if (F.Length >= 2 && RIdx >= 0 && RemotePlayers[RIdx].RemotePawn != None)
         {
-            RemoteModelIndex = int(F[1]);
-            ApplyModelToHero(OLHero(RemotePawn), RemoteModelIndex, false);
+            RemotePlayers[RIdx].ModelIndex = int(F[1]);
+            ApplyModelToHero(OLHero(RemotePlayers[RIdx].RemotePawn), RemotePlayers[RIdx].ModelIndex, false);
         }
         return;
     }
+
     if (Left(Data, 5) == "NAME,")
     {
-        RemotePlayerName = Right(Data, Len(Data) - 5);
-        if (RemotePlayerName == "") RemotePlayerName = "Player";
+        if (RIdx >= 0)
+        {
+            RemotePlayers[RIdx].PlayerName = Right(Data, Len(Data) - 5);
+            if (RemotePlayers[RIdx].PlayerName == "")
+                RemotePlayers[RIdx].PlayerName = "Player";
+        }
         return;
     }
+
     if (Left(Data, 5) == "PONG,")
     {
         F = SplitString(Data, ",", true);
@@ -1037,348 +960,105 @@ function OnReceiveData(string Data)
         }
         return;
     }
+
     if (Left(Data, 6) == "NOTIF,") { AddNotification(Right(Data, Len(Data) - 6)); return; }
     if (Left(Data, 5) == "SRUN,") { HandleSpeedrunPacket(Data); return; }
+
     if (Left(Data, 5) == "TALK,")
     {
         F = SplitString(Data, ",", true);
-        if (F.Length >= 2)
-            bRemoteTalking = (int(F[1]) != 0) && !(Settings != None && Settings.bMuteRemotePlayer);
+        if (F.Length >= 2 && RIdx >= 0)
+        {
+            if (int(F[1]) != 0)
+                RemotePlayers[RIdx].bTalking = !(Settings != None && Settings.bMuteRemotePlayer);
+            else
+                RemotePlayers[RIdx].bTalking = false;
+        }
         return;
     }
+
+    if (Left(Data, 10) == "SPECIAL_S,")
+    {
+        F = SplitString(Data, ",", true);
+        if (F.Length >= 3 && RIdx >= 0 && RemotePlayers[RIdx].RemoteCtrl != None)
+        {
+            RemoteV2 = OLTogetherRemoteControllerV2(RemotePlayers[RIdx].RemoteCtrl);
+            if (RemoteV2 != None)
+                RemoteV2.SetRemoteSpecialStart(int(F[1]), int(F[2]) != 0);
+        }
+        return;
+    }
+
+    if (Left(Data, 9) == "SPECIAL_E")
+    {
+        // Ignored - SM transitions are handled by LOC packets now
+        return;
+    }
+
+    // Handle legacy full-state packets (LOC,...) - delta encoding disabled for now due to UnrealScript limitations
+    if (Left(Data, 4) != "LOC,") return;
+    if (RIdx < 0) return;
+
     F = SplitString(Data, ",", true);
-    if (F.Length < 17 || F[0] != "LOC") return;
-    IL.X = float(F[1]); IL.Y = float(F[2]); IL.Z = float(F[3]);
-    IR.Pitch = int(F[4]); IR.Yaw = int(F[5]); IR.Roll = 0;
-    IV.X = float(F[6]); IV.Y = float(F[7]); IV.Z = float(F[8]);
-    CC = int(F[9]) != 0;
-    BC = int(F[10]) != 0;
-    CS = int(F[11]);
-    LM = int(F[12]);
-    SM = int(F[13]);
-    DD = int(F[14]);
-    LD = (F.Length >= 16) ? int(F[15]) : 0;
-    ED = (F.Length >= 17) ? int(F[16]) : 0;
-    ET = (F.Length >= 18) ? int(F[17]) : 0;
-    HP = (F.Length >= 19) ? int(F[18]) : 100;
-    LastReceivedLoc = IL;
-    LastReceivedVel = IV;
-    // Capture the pawn's facing, start position and forward axis when a jump-over
-    // starts. In Outlast you can't strafe while vaulting, so the move is a straight
-    // line along the entry facing. We freeze the facing (no 20 Hz yaw spin) and
-    // project the networked target onto that line so lateral network jitter can't
-    // push the body sideways around the object.
-    bWasJumpingOver = (LastRemoteSpecialMove == 5 || LastRemoteSpecialMove == 6);
-    bJumpingOverNow = (SM == 5 || SM == 6);
-    if (bJumpingOverNow && !bWasJumpingOver)
+    if (F.Length < 18 || F[0] != "LOC") return;
+
+    TS = float(F[1]);
+    IL.X = float(F[2]); IL.Y = float(F[3]); IL.Z = float(F[4]);
+    IR.Pitch = int(F[5]); IR.Yaw = int(F[6]); IR.Roll = 0;
+    IV.X = float(F[7]); IV.Y = float(F[8]); IV.Z = float(F[9]);
+    CC = int(F[10]) != 0; BC = int(F[11]) != 0; CS = int(F[12]);
+    LM = int(F[13]); SM = int(F[14]); DD = int(F[15]);
+    LD = (F.Length >= 17) ? int(F[16]) : 0;
+    ED = (F.Length >= 18) ? int(F[17]) : 0;
+    ET = (F.Length >= 19) ? int(F[18]) : 0;
+    HP = (F.Length >= 20) ? int(F[19]) : 100;
+    bRunning = (F.Length >= 21) ? int(F[20]) != 0 : VSize(IV) > 300.0;
+    bPlayingAnim = (F.Length >= 22) ? int(F[21]) != 0 : false;
+    DoorRatio = (F.Length >= 23) ? float(F[22]) : 0.0;
+
+    // Door sync fields (fields 23, 24)
+    DoorSyncId = (F.Length >= 24) ? int(F[23]) : 0;
+    DoorSyncOpenRatio = (F.Length >= 25) ? float(F[24]) : -1.0;
+
+    RemotePlayers[RIdx].Health = HP;
+
+    if (RemotePlayers[RIdx].RemoteCtrl != None)
     {
-        JumpOverLockRot = (RemotePawn != None) ? RemotePawn.Rotation : IR;
-        JumpOverLockStartPos = (RemotePawn != None) ? RemotePawn.Location : IL;
-        JumpOverLockFwd = vector(JumpOverLockRot);
-        JumpOverLockFwd.Z = 0;
-        if (VSize(JumpOverLockFwd) > 0.0)
-            JumpOverLockFwd = Normal(JumpOverLockFwd);
-    }
-    LastRemoteSpecialMove = SM;
-    if (LM != 3 && LM != 4 && LM != 5 && LM != 6 && LM != 10)
-    {
-        LastReceivedRot = IR;
-    }
-    RemoteHealth = HP;
-    bHasReceivedData = true;
-    if (RemotePawn == None) return;
-    RH = OLHero(RemotePawn);
-    LastLeanInputDir = LD;
-    if (CC != bRemotePawnCrouched)
-    {
-        bRemotePawnCrouched = CC;
-        AnimLockEndTime = WorldInfo.TimeSeconds + 0.55;
-        if (bRemotePawnCrouched)
-            PlayBodyAnim('player_stand_to_crouch', 0.1, 0.0, false, 1.0);
-        else
-            PlayBodyAnim('player_crouch_to_stand', 0.1, 0.0, false, 1.0);
-    }
-    if (BC != bLastRemoteCamcorder)
-    {
-        bLastRemoteCamcorder = BC;
-        RH.bCamcorderDesired = BC;
-        if (RH.CameraMeshShadowProxy != None)
+        RemoteV2 = OLTogetherRemoteControllerV2(RemotePlayers[RIdx].RemoteCtrl);
+        if (RemoteV2 != None)
         {
-            if (BC) { ClearTimer('HideCamcorderProp'); RH.CameraMeshShadowProxy.SetHidden(false); }
-            else SetTimer(0.55, false, 'HideCamcorderProp');
-        }
-        if (RH.ShadowProxyRightArmAnimSlot != None)
-        {
-            if (BC)
-            {
-                RH.ShadowProxyRightArmAnimSlot.PlayCustomAnim(bRemotePawnCrouched ? 'player_crouch_camcorder_raise' : 'player_camcorder_raise', 1.0, 0.15, 0.15, false, true);
-                SetTimer(0.50, false, 'PlayCamcorderIdleAnim');
-            }
-            else
-            {
-                ClearTimer('PlayCamcorderIdleAnim');
-                RH.ShadowProxyRightArmAnimSlot.PlayCustomAnim(bRemotePawnCrouched ? 'player_crouch_camcorder_lower' : 'player_camcorder_lower', 1.0, 0.15, 0.15, false, true);
-            }
-        }
-    }
-    if (CS != LastRemoteCamcorderState)
-    {
-        if (CS == 4)
-        {
-            ClearTimer('PlayCamcorderIdleAnim');
-            ClearTimer('FinishInactiveReload');
-            if (RH.ShadowProxyRightArmAnimSlot != None)
-                RH.ShadowProxyRightArmAnimSlot.PlayCustomAnim(bRemotePawnCrouched ? 'player_crouch_camcorder_reload' : 'player_camcorder_reload', 1.0, 0.15, 0.05, false, true);
-            if (RH.ShadowProxyLeftArmAnimSlot != None)
-                RH.ShadowProxyLeftArmAnimSlot.PlayCustomAnim(bRemotePawnCrouched ? 'player_crouch_camcorder_reload' : 'player_camcorder_reload', 1.0, 0.15, 0.4, false, true);
-            SetTimer(2.85, false, 'PlayCamcorderIdleAnim');
-        }
-        else if (CS == 5)
-        {
-            ClearTimer('PlayCamcorderIdleAnim');
-            ClearTimer('FinishInactiveReload');
-            if (RH.CameraMeshShadowProxy != None && !bHideLocalPawnDuringSpeedrun)
-                RH.CameraMeshShadowProxy.SetHidden(false);
-            if (RH.ShadowProxyRightArmAnimSlot != None)
-                RH.ShadowProxyRightArmAnimSlot.PlayCustomAnim(bRemotePawnCrouched ? 'player_crouch_camcorder_reload_inactive' : 'player_camcorder_reload_inactive', 1.0, 0.15, 0.05, false, true);
-            if (RH.ShadowProxyLeftArmAnimSlot != None)
-                RH.ShadowProxyLeftArmAnimSlot.StopCustomAnim(0.15);
-            SetTimer(2.85, false, 'FinishInactiveReload');
-        }
-        else if (LastRemoteCamcorderState == 4 || LastRemoteCamcorderState == 5)
-        {
-            ClearTimer('PlayCamcorderIdleAnim');
-            ClearTimer('FinishInactiveReload');
-            if (CS == 1 && BC)
-            {
-                PlayCamcorderIdleAnim();
-                if (RH.ShadowProxyLeftArmAnimSlot != None)
-                    RH.ShadowProxyLeftArmAnimSlot.StopCustomAnim(0.2);
-            }
-            else
-            {
-                if (RH.CameraMeshShadowProxy != None)
-                    RH.CameraMeshShadowProxy.SetHidden(true);
-                if (RH.ShadowProxyRightArmAnimSlot != None)
-                    RH.ShadowProxyRightArmAnimSlot.StopCustomAnim(0.15);
-                if (RH.ShadowProxyLeftArmAnimSlot != None)
-                    RH.ShadowProxyLeftArmAnimSlot.StopCustomAnim(0.15);
-            }
-        }
-        LastRemoteCamcorderState = CS;
-    }
-    if (LM != LastLocomotionMode)
-    {
-        PL = LastLocomotionMode;
-        LastLocomotionMode = LM;
-        if (LM == 3 || LM == 4)
-        {
-            if (RH.CameraMeshShadowProxy != None)
-                RH.CameraMeshShadowProxy.SetHidden(true);
-            if (RH.ShadowProxyRightArmAnimSlot != None)
-                RH.ShadowProxyRightArmAnimSlot.StopCustomAnim(0.15);
-            if (RH.ShadowProxyLeftArmAnimSlot != None)
-                RH.ShadowProxyLeftArmAnimSlot.StopCustomAnim(0.15);
-        }
-        else if ((PL == 3 || PL == 4) && bLastRemoteCamcorder)
-        {
-            if (PL == 4 && (LM == 2 && (SM == 6 || SM == 14 || SM == 17 || SM == 19 || (SM >= 16 && SM <= 23))))
-            {
-                bCamcorderPendingRestore = true;
-                SetTimer(1.05, false, 'RestoreCamcorderAfterLedge');
-            }
-            else
-            {
-                bCamcorderPendingRestore = false;
-                ClearTimer('RestoreCamcorderAfterLedge');
-                if (RH.CameraMeshShadowProxy != None)
-                    RH.CameraMeshShadowProxy.SetHidden(false);
-                PlayCamcorderIdleAnim();
-            }
-        }
-        switch (LM)
-        {
-            case 1:
-                RH.LocomotionMode = LM_Fall;
-                LastMovementAnim = 'None';
-                LastLeanInputDir = 0;
-                break;
-            case 2:
-                switch (SM)
-                {
-                    case 3:  PlayBodyAnim('player_jump_on_spot', 0.1, 0.0, false, 1.0); break;
-                    case 5:  PlayBodyAnim((VSize(IV) > 300.0 ? 'player_jump_over_from_run' : 'player_jump_over_from_walk'), 0.1, 0.0, false, 1.0, false); break;
-                    case 6:  PlayBodyAnim('player_jump_over_to_ledge', 0.1, 0.0, false, 1.0, false); break;
-                    case 7:  PlayBodyAnim('player_slide_over_from_run', 0.1, 0.0, false, 1.0); break;
-                    case 8:  PlayBodyAnim((VSize(IV) > 300.0 ? 'player_climb_up_from_run' : 'player_climb_up_from_walk'), 0.1, 0.0, false, 1.0); break;
-                    case 9:  PlayBodyAnim('player_climb_up_wall_2m', 0.1, 0.0, false, 1.0); break;
-                    case 10: PlayBodyAnim('player_climb_over_wall_2m', 0.1, 0.0, false, 1.0); break;
-                    case 14: PlayBodyAnim('player_jump_to_ledge_from_walk', 0.1, 0.0, false, 1.0); break;
-                    case 17: PlayBodyAnim('player_climb_ledge_to_stand', 0.1, 0.0, false, 1.0); break;
-                    case 18: PlayBodyAnim('player_ledge_walk_stepoff', 0.1, 0.0, false, 1.0); break;
-                    case 19: PlayBodyAnim('player_climb_ledge_to_stand', 0.1, 0.0, false, 1.0); break;
-                    case 4:  PlayBodyAnim('player_landing_big', 0.05, 0.1, false, 1.0); break;
-                    case 16:
-                        switch (ET)
-                        {
-                            case 1:  PlayBodyAnim('player_ledge_move_left_90_outside', 0.1, 0.0, false, 1.0); break;
-                            case 2:  PlayBodyAnim('player_ledge_move_right_90_inside', 0.1, 0.0, false, 1.0); break;
-                            case 3:  PlayBodyAnim('player_ledge_move_right_90_outside', 0.1, 0.0, false, 1.0); break;
-                            default: PlayBodyAnim('player_ledge_move_left_90_inside', 0.1, 0.0, false, 1.0); break;
-                        }
-                        break;
-                    case 20:
-                        switch (ET)
-                        {
-                            case 1:  PlayBodyAnim('player_ledge_walk_enter_left_outside_perp', 0.1, 0.0, false, 1.0); break;
-                            case 2:  PlayBodyAnim('player_ledge_walk_enter_right_inside_perp', 0.1, 0.0, false, 1.0); break;
-                            case 3:  PlayBodyAnim('player_ledge_walk_enter_right_outside_perp', 0.1, 0.0, false, 1.0); break;
-                            default: PlayBodyAnim('player_ledge_walk_enter_left_inside_perp', 0.1, 0.0, false, 1.0); break;
-                        }
-                        break;
-                    case 21:
-                        switch (ET)
-                        {
-                            case 1:  PlayBodyAnim('player_ledge_walk_exit_left_outside_left', 0.1, 0.0, false, 1.0); break;
-                            case 2:  PlayBodyAnim('player_ledge_walk_exit_right_inside_left', 0.1, 0.0, false, 1.0); break;
-                            case 3:  PlayBodyAnim('player_ledge_walk_exit_right_outside_right', 0.1, 0.0, false, 1.0); break;
-                            default: PlayBodyAnim('player_ledge_walk_exit_left_inside_right', 0.1, 0.0, false, 1.0); break;
-                        }
-                        break;
-                    case 22:
-                        switch (ET)
-                        {
-                            case 1:  PlayBodyAnim('player_ledge_walk_transition_left_90_outside', 0.1, 0.0, false, 1.0); break;
-                            case 2:  PlayBodyAnim('player_ledge_walk_transition_right_90_inside', 0.1, 0.0, false, 1.0); break;
-                            case 3:  PlayBodyAnim('player_ledge_walk_transition_right_90_outside', 0.1, 0.0, false, 1.0); break;
-                            default: PlayBodyAnim('player_ledge_walk_transition_left_90_inside', 0.1, 0.0, false, 1.0); break;
-                        }
-                        break;
-                    case 23: PlayBodyAnim('player_jump_from_ledge_walk', 0.1, 0.0, false, 1.0); break;
-                    case 24: PlayBodyAnim((ED != 0) ? 'player_squeeze_enter_left' : 'player_squeeze_enter_right', 0.1, 0.0, false, 1.0); break;
-                    case 25: PlayBodyAnim((ED != 0) ? 'player_squeeze_exit_left' : 'player_squeeze_exit_right', 0.1, 0.0, false, 1.0); break;
-                    case 26: PlayBodyAnim('player_squeeze_through', 0.1, 0.0, false, 1.0); break;
-                    case 27:
-                        if (RH.ShadowProxyRightArmAnimSlot != None)
-                            RH.ShadowProxyRightArmAnimSlot.PlayCustomAnim(bLastRemoteCamcorder ? 'player_squeeze_camera_reload' : 'player_squeeze_camera_reload_inactive', 1.0, 0.15, 0.05, false, true);
-                        if (RH.ShadowProxyLeftArmAnimSlot != None)
-                            RH.ShadowProxyLeftArmAnimSlot.PlayCustomAnim(bLastRemoteCamcorder ? 'player_squeeze_camera_reload' : 'player_squeeze_camera_reload_inactive', 1.0, 0.15, 0.4, false, true);
-                        break;
-                    case 44: PlayBodyAnim('player_ladder_enter_above', 0.1, 0.0, false, 1.0); break;
-                    case 48: PlayBodyAnim('player_ladder_grab_from_air', 0.1, 0.0, false, 1.0); break;
-                    case 28:
-                        LastDoorInputDir = DD;
-                        PlayBodyAnim((DD < 2) ? 'player_door_access_left' : 'player_door_access_right', 0.1, 0.0, false, 1.0);
-                        break;
-                    case 29:
-                        switch (DD)
-                        {
-                            case 0: PlayBodyAnim('player_door_open_push_left', 0.1, 0.0, false, 1.0); break;
-                            case 1: PlayBodyAnim('player_door_open_pull_left', 0.1, 0.0, false, 1.0); break;
-                            case 2: PlayBodyAnim('player_door_open_push_right', 0.1, 0.0, false, 1.0); break;
-                            default: PlayBodyAnim('player_door_open_pull_right', 0.1, 0.0, false, 1.0); break;
-                        }
-                        break;
-                    case 30: PlayBodyAnim((DD < 2) ? 'player_door_open_inside_left' : 'player_door_open_inside_right', 0.1, 0.0, false, 1.0); break;
-                    case 31: PlayBodyAnim((DD < 2) ? 'player_door_locked_left' : 'player_door_locked_right', 0.1, 0.0, false, 1.0); break;
-                    case 32: PlayBodyAnim((DD < 2) ? 'player_run_door_open_left' : 'player_run_door_open_right', 0.05, 0.1, false, 1.0); break;
-                    case 33: case 34:
-                        switch (DD)
-                        {
-                            case 0: PlayBodyAnim('player_door_close_left_front', 0.1, 0.0, false, 1.0); break;
-                            case 1: PlayBodyAnim('player_door_close_left_side', 0.1, 0.0, false, 1.0); break;
-                            case 2: PlayBodyAnim('player_door_close_left_back', 0.1, 0.0, false, 1.0); break;
-                            case 3: PlayBodyAnim('player_door_close_inside_left', 0.1, 0.0, false, 1.0); break;
-                            case 4: PlayBodyAnim('player_door_close_right_front', 0.1, 0.0, false, 1.0); break;
-                            case 5: PlayBodyAnim('player_door_close_right_side', 0.1, 0.0, false, 1.0); break;
-                            case 6: PlayBodyAnim('player_door_close_right_back', 0.1, 0.0, false, 1.0); break;
-                            default: PlayBodyAnim('player_door_close_inside_right', 0.1, 0.0, false, 1.0); break;
-                        }
-                        break;
-                    case 37: PlayBodyAnim('player_locker_open_straight', 0.1, 0.2, false, 1.0); break;
-                    case 38: PlayBodyAnim('player_locker_hide', 0.3, -1.0, true, 1.0); break;
-                    case 39: PlayBodyAnim('player_locker_exit', 0.1, 0.1, false, 1.0); break;
-                    case 40:
-                        PlayBodyAnim(
-                            bRemotePawnCrouched ? ((ED != 0) ? 'player_enter_bed_left' : 'player_enter_bed_right') : ((ED != 0) ? 'player_enter_bed_left_stand' : 'player_enter_bed_right_stand'),
-                            0.15, 0.0, false, 1.0);
-                        break;
-                    case 41: PlayBodyAnim((ED != 0) ? 'player_exit_bed_left' : 'player_exit_bed_right', 0.1, 0.1, false, 1.0); break;
-                    case 49: PlayBodyAnim(bRemotePawnCrouched ? 'player_crouch_object_pickup_h45v35' : 'player_object_pickup_h62v105', 0.1, 0.1, false, 1.0); break;
-                    case 54: PlayBodyAnim((ED != 0) ? 'player_push_object_enter_left' : 'player_push_object_enter_right', 0.1, 0.0, false, 1.0); break;
-                    case 55: PlayBodyAnim((ED != 0) ? 'player_push_object_exit_left' : 'player_push_object_exit_right', 0.1, 0.0, false, 1.0); break;
-                    case 57: PlayBodyAnim('player_crouch_over_ledge', 0.1, 0.0, false, 1.0); break;
-                    case 62: PlayBodyAnim('player_grab', 0.1, 0.0, false, 1.0); break;
-                    case 67: PlayBodyAnim('player_grab_throw', 0.1, 0.0, false, 1.0); break;
-                    case 69: case 70: PlayBodyAnim('player_stand_death', 0.1, 0.0, false, 1.0); break;
-                }
-                LastMovementAnim = 'None';
-                LastLeanInputDir = 0;
-                break;
-            case 7:
-                PlayBodyAnim((LastDoorInputDir < 2) ? 'player_door_access_left' : 'player_door_access_right', 0.15, -1.0, true, 1.0);
-                LastMovementAnim = 'None';
-                LastLeanInputDir = 0;
-                break;
-            case 8:
-                PlayBodyAnim('player_locker_hide', 0.2, -1.0, true, 1.0);
-                LastMovementAnim = 'None';
-                LastLeanInputDir = 0;
-                break;
-            case 3:  RH.LocomotionMode = LM_Ladder;         LastMovementAnim = 'None'; LastLeanInputDir = 0; break;
-            case 4:  RH.LocomotionMode = LM_LedgeHang;      LastMovementAnim = 'None'; LastLeanInputDir = 0; break;
-            case 5:  RH.LocomotionMode = LM_LedgeWalk;      LastMovementAnim = 'None'; LastLeanInputDir = 0; break;
-            case 15: RH.LocomotionMode = LM_ContextualLean; LastMovementAnim = 'None'; LastLeanInputDir = 0; break;
-            case 6:  RH.LocomotionMode = LM_Squeeze;        LastMovementAnim = 'None'; LastLeanInputDir = 0; break;
-            case 10: RH.LocomotionMode = LM_Bed;            LastMovementAnim = 'None'; LastLeanInputDir = 0; break;
-            case 12: RH.LocomotionMode = LM_Struggle;       LastMovementAnim = 'None'; LastLeanInputDir = 0; break;
-            case 13: RH.LocomotionMode = LM_Grabbed;        LastMovementAnim = 'None'; LastLeanInputDir = 0; break;
-            case 14: RH.LocomotionMode = LM_Pushing;        LastMovementAnim = 'None'; LastLeanInputDir = 0; break;
-            case 0: default:
-                RH.LocomotionMode = LM_Walk;
-                if (PL == 1) PlayBodyAnim('player_land', 0.05, 0.1, false, 1.0);
-                else if (PL == 7) StopBodyAnim(0.15);
-                else if (PL == 8) PlayBodyAnim('player_locker_exit', 0.1, 0.1, false, 1.0);
-                else if (PL == 3 || PL == 4 || PL == 5) StopBodyAnim(0.15);
-                else if (PL == 6 || PL == 12 || PL == 13 || PL == 14) StopBodyAnim(0.2);
-                LastMovementAnim = 'None';
-                LastLeanInputDir = 0;
-                break;
+            RemoteV2.AddState(TS, IL, IR, IV, CC, BC, CS, LM, SM, DD, LD, ED, ET, HP, bRunning, bPlayingAnim, DoorRatio);
+            RemoteV2.SyncDoorState(DoorSyncId, DoorSyncOpenRatio);
         }
     }
 }
+
 function HandleSpeedrunPacket(string Data)
 {
     local array<string> F;
     F = SplitString(Data, ",", true);
     if (F.Length < 2) return;
-    if (F[1] == "READY")    { bPeerIsReady = true; if (bSpeedrunReady && !bSpeedrunSequenceActive) BeginSpeedrunSequence(); }
+    if (F[1] == "READY") { bPeerIsReady = true; if (bSpeedrunReady && !bSpeedrunSequenceActive) BeginSpeedrunSequence(); }
     else if (F[1] == "UNREADY") bPeerIsReady = false;
     else if (F[1] == "SEQ")  BeginSpeedrunSequenceClient();
     else if (F[1] == "TP")   SpeedrunSequenceTeleportClient();
     else if (F[1] == "GO")   SpeedrunRemoteGo();
 }
-defaultproperties
+
+DefaultProperties
 {
-    InputClass=class'Multiplayer.OLTogetherInput'
-    bHasReceivedData=false
-    InterpSpeed=12.0
-    bLastRemoteCamcorder=false
-    LastRemoteCamcorderState=0
-    bLocalRunning=false
-    bRemotePawnCrouched=false
-    LastLocomotionMode=0
-    LastDoorInputDir=0
-    LastLeanInputDir=0
-    RemoteHealth=100
+    InputClass=class'OLTogetherInput'
     bSpeedrunSequenceActive=false
     bSpeedrunControlsLocked=false
     bHideLocalPawnDuringSpeedrun=false
     SpeedrunOverlayAlpha=0.0
     SpeedrunOverlayPulse=0.0
     LocalModelIndex=0
-    RemoteModelIndex=0
     bModelAnnounced=false
     LastSentModelIndex=-1
     LastModelSendTime=-999.0
+    LastSentSpecialMove=0
+    MyPlayerCid=0
+    IdleStateSendInterval=0.25
+    ActiveStateSendInterval=0.033
 }

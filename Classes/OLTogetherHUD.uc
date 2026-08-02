@@ -610,6 +610,7 @@ function DrawNotificationsPanel()
 
 function DrawNameTag(OLTogetherController PC)
 {
+    local int I;
     local vector NameScreen, NameWorld, CamLoc;
     local rotator CamRot;
     local float NameXL, NameYL, NameX, NameY, TextScale, Pad;
@@ -619,84 +620,79 @@ function DrawNameTag(OLTogetherController PC)
     local byte HR, HG, HB;
     local string NameText;
 
-    if (PC.RemotePawn == None || PC.RemotePlayerName == "")
-        return;
-
     TextScale = 0.85 * UIScale;
     Pad = 5.0 * UIScale;
 
-    NameText = PC.RemotePlayerName;
-    NameWorld = PC.RemotePawn.Location + vect(0.0, 0.0, 175.0);
-
-    CamLoc = NameWorld;
-    PC.GetPlayerViewPoint(CamLoc, CamRot);
-    Dist = VSize(NameWorld - CamLoc);
-
-    // Far fade: tag dims out as the remote player gets far away.
-    DistAlpha = 1.0;
-    if (Dist > NameFadeStartDist)
-        DistAlpha = 1.0 - (Dist - NameFadeStartDist) / (NameFadeEndDist - NameFadeStartDist);
-    DistAlpha = FClamp(DistAlpha, 0.0, 1.0);
-
-    // Near fade: tag becomes transparent up close and disappears when very near,
-    // so it does not obstruct face-to-face interactions.
-    NearAlpha = 1.0;
-    if (Dist < NameNearFadeStart)
-        NearAlpha = (Dist - NameNearFadeEnd) / (NameNearFadeStart - NameNearFadeEnd);
-    NearAlpha = FClamp(NearAlpha, 0.0, 1.0);
-
-    DistAlpha = FMin(DistAlpha, NearAlpha);
-    if (DistAlpha <= 0.01)
-        return;
-
-    NameScreen = Canvas.Project(NameWorld);
-    if (NameScreen.Z <= 0.0)
-        return;
-
-    A = 255.0 * DistAlpha;
-
-    NameXL = MeasureW(NameText, TextScale);
-    NameYL = MeasureH(NameText, TextScale);
-
-    BarH = FMax(3.0, 5.0 * UIScale);
-    TalkBoxSize = 10.0 * UIScale;
-    // The tag is as wide as the name, but never narrower than the health bar.
-    // Add room for the talking indicator when it's active.
-    TagW = FMax(NameXL + (PC.bRemoteTalking ? TalkBoxSize + 8.0 * UIScale : 0.0), 90.0 * UIScale);
-    TagX = NameScreen.X - (TagW * 0.5);
-    NameX = NameScreen.X - (NameXL * 0.5);
-    NameY = NameScreen.Y - NameYL - BarH - 10.0 * UIScale;
-    TagY = NameY - Pad * 0.5;
-
-    // Backing plate + accent line spanning the whole tag width.
-    DrawFilledBox(TagX - Pad, TagY, TagW + Pad * 2.0, NameYL + BarH + Pad * 2.0, 12, 13, 16, byte(190.0 * DistAlpha));
-    DrawFilledBox(TagX - Pad, TagY, TagW + Pad * 2.0, FMax(1.0, 2.0 * UIScale), 120, 122, 130, byte(220.0 * DistAlpha));
-
-    DrawLabel(NameText, NameX, NameY, TextScale, 230, 232, 240, byte(A));
-
-    if (PC.bRemoteTalking)
+    for (I = 0; I < PC.RemotePlayers.Length; I++)
     {
-        TalkBoxX = NameX + NameXL + 8.0 * UIScale;
-        TalkBoxY = NameY + FMax(0.0, (NameYL - TalkBoxSize) * 0.5);
-        DrawFilledBox(TalkBoxX, TalkBoxY, TalkBoxSize, TalkBoxSize, 255, 255, 255, byte(A));
-    }
+        if (PC.RemotePlayers[I].RemotePawn == None || PC.RemotePlayers[I].PlayerName == "")
+            continue;
 
-    // Health bar (green, max 100) sourced from the replicated PreciseHealth.
-    HealthPct = FClamp(float(PC.RemoteHealth) / 100.0, 0.0, 1.0);
-    BarW = TagW;
-    BarX = TagX;
-    BarY = NameY + NameYL + 3.0 * UIScale;
+        NameText = PC.RemotePlayers[I].PlayerName;
+        NameWorld = PC.RemotePlayers[I].RemotePawn.Location + vect(0.0, 0.0, 175.0);
 
-    DrawFilledBox(BarX, BarY, BarW, BarH, 30, 32, 36, byte(200.0 * DistAlpha));
-    if (HealthPct > 0.0)
-    {
-        // Shade from green toward red as health drops, staying mostly green.
-        HR = byte((1.0 - HealthPct) * 200.0);
-        HG = byte(60.0 + HealthPct * 175.0);
-        HB = 60;
-        DrawFilledBox(BarX, BarY, BarW * HealthPct, BarH, HR, HG, HB, byte(235.0 * DistAlpha));
+        CamLoc = NameWorld;
+        PC.GetPlayerViewPoint(CamLoc, CamRot);
+        Dist = VSize(NameWorld - CamLoc);
+
+        DistAlpha = 1.0;
+        if (Dist > NameFadeStartDist)
+            DistAlpha = 1.0 - (Dist - NameFadeStartDist) / (NameFadeEndDist - NameFadeStartDist);
+        DistAlpha = FClamp(DistAlpha, 0.0, 1.0);
+
+        NearAlpha = 1.0;
+        if (Dist < NameNearFadeStart)
+            NearAlpha = (Dist - NameNearFadeEnd) / (NameNearFadeStart - NameNearFadeEnd);
+        NearAlpha = FClamp(NearAlpha, 0.0, 1.0);
+
+        DistAlpha = FMin(DistAlpha, NearAlpha);
+        if (DistAlpha <= 0.01)
+            continue;
+
+        NameScreen = Canvas.Project(NameWorld);
+        if (NameScreen.Z <= 0.0)
+            continue;
+
+        A = 255.0 * DistAlpha;
+
+        NameXL = MeasureW(NameText, TextScale);
+        NameYL = MeasureH(NameText, TextScale);
+
+        BarH = FMax(3.0, 5.0 * UIScale);
+        TalkBoxSize = 10.0 * UIScale;
+        TagW = FMax(NameXL + (PC.RemotePlayers[I].bTalking ? TalkBoxSize + 8.0 * UIScale : 0.0), 90.0 * UIScale);
+        TagX = NameScreen.X - (TagW * 0.5);
+        NameX = NameScreen.X - (NameXL * 0.5);
+        NameY = NameScreen.Y - NameYL - BarH - 10.0 * UIScale;
+        TagY = NameY - Pad * 0.5;
+
+        DrawFilledBox(TagX - Pad, TagY, TagW + Pad * 2.0, NameYL + BarH + Pad * 2.0, 12, 13, 16, byte(190.0 * DistAlpha));
+        DrawFilledBox(TagX - Pad, TagY, TagW + Pad * 2.0, FMax(1.0, 2.0 * UIScale), 120, 122, 130, byte(220.0 * DistAlpha));
+
+        DrawLabel(NameText, NameX, NameY, TextScale, 230, 232, 240, byte(A));
+
+        if (PC.RemotePlayers[I].bTalking)
+        {
+            TalkBoxX = NameX + NameXL + 8.0 * UIScale;
+            TalkBoxY = NameY + FMax(0.0, (NameYL - TalkBoxSize) * 0.5);
+            DrawFilledBox(TalkBoxX, TalkBoxY, TalkBoxSize, TalkBoxSize, 255, 255, 255, byte(A));
+        }
+
+        HealthPct = FClamp(float(PC.RemotePlayers[I].Health) / 100.0, 0.0, 1.0);
+        BarW = TagW;
+        BarX = TagX;
+        BarY = NameY + NameYL + 3.0 * UIScale;
+
+        DrawFilledBox(BarX, BarY, BarW, BarH, 30, 32, 36, byte(200.0 * DistAlpha));
+        if (HealthPct > 0.0)
+        {
+            HR = byte((1.0 - HealthPct) * 200.0);
+            HG = byte(60.0 + HealthPct * 175.0);
+            HB = 60;
+            DrawFilledBox(BarX, BarY, BarW * HealthPct, BarH, HR, HG, HB, byte(235.0 * DistAlpha));
+        }
+        DrawFilledBox(BarX, BarY, BarW, FMax(1.0, UIScale), 90, 92, 100, byte(120.0 * DistAlpha));
     }
-    DrawFilledBox(BarX, BarY, BarW, FMax(1.0, UIScale), 90, 92, 100, byte(120.0 * DistAlpha));
 }
 
 function UpdateChatAnimation(OLTogetherController PC, float Delta)
@@ -1465,7 +1461,7 @@ function string SettingsRowLabel(OLTogetherController PC, int RowIndex)
                 case 3: return "Auto Reconnect";
                 case 4: return "Reconnect Delay";
                 case 5: return "Nearby Player Fade";
-                case 6: return "Mute Remote Player";
+                case 6: return "Mute All Remote Players";
             }
             break;
         case 1:
@@ -1474,7 +1470,7 @@ function string SettingsRowLabel(OLTogetherController PC, int RowIndex)
                 case 0: return "Mute Everyone";
                 case 1: return "Push To Talk";
                 case 2: return "Voice Proximity";
-                case 3: return "Mute Remote Player";
+                case 3: return "Mute All Remote Players";
             }
             break;
         case 2:

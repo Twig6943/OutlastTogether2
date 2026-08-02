@@ -18,7 +18,7 @@ var config bool bMuteEveryone;
 var config float VoiceProximityNear;
 var config float VoiceProximityFar;
 
-// Silence the specific remote player (single-remote relay design).
+// Silence all remote players (multi-player relay design).
 var config bool bMuteRemotePlayer;
 
 // Fade nearby players when very close (avoids view collision).

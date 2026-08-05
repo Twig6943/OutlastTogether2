@@ -225,6 +225,42 @@ function int FindOrCreateRemote(int CID)
     return RemotePlayers.Length - 1;
 }
 
+function DestroyRemotePlayer(int CID)
+{
+    local int Idx;
+    
+    for (Idx = RemotePlayers.Length - 1; Idx >= 0; Idx--)
+    {
+        if (RemotePlayers[Idx].CID == CID)
+        {
+            `log("[CLEANUP] Destroying remote player CID:" @ CID @ "Name:" @ RemotePlayers[Idx].PlayerName);
+            
+            // Unpossess and destroy the controller
+            if (RemotePlayers[Idx].RemoteCtrl != None)
+            {
+                if (RemotePlayers[Idx].RemotePawn != None)
+                    RemotePlayers[Idx].RemoteCtrl.UnPossess();
+                RemotePlayers[Idx].RemoteCtrl.Destroy();
+                RemotePlayers[Idx].RemoteCtrl = None;
+            }
+            
+            // Destroy the pawn
+            if (RemotePlayers[Idx].RemotePawn != None)
+            {
+                RemotePlayers[Idx].RemotePawn.Destroy();
+                RemotePlayers[Idx].RemotePawn = None;
+            }
+            
+            // Remove from array
+            RemotePlayers.Remove(Idx, 1);
+            
+            `log("[CLEANUP] Remote player destroyed and removed. Remaining:" @ RemotePlayers.Length);
+            return;
+        }
+    }
+    `log("[CLEANUP] CID not found:" @ CID);
+}
+
 event PostBeginPlay()
 {
     local string Url, V, PortStr;
@@ -438,6 +474,78 @@ function float GetDoorSyncOpenRatio(OLHero H)
     return -1.0;
 }
 
+// Map currently playing cutscene animation to an ID for network transmission
+function int GetCutsceneAnimId(OLHero H)
+{
+    local name AnimName;
+    
+    if (H == None || H.FullBodyAnimSlot == None)
+        return 0;
+    
+    // Get the currently playing animation on the full body slot
+    AnimName = H.FullBodyAnimSlot.GetPlayedAnimation();
+    
+    switch (AnimName)
+    {
+        case 'SE_AdminBlock_IntroMiles_p1_hero': return 1;
+        case 'SE_AdminBlock_IntroMiles_p2_hero': return 2;
+        case 'SE_AdminBlock_PriestDrugsMiles_hero': return 3;
+        case 'SE_AdminBlockRv_AirventPushCorpse_hero': return 4;
+        case 'SE_Miles_PriestIntro_01': return 5;
+        case 'SE_Miles_PriestIntro_OnTheFloor_01': return 6;
+        case 'SE_Miles_PriestIntro_StandingUp_01': return 7;
+        case 'SE_PatientAttack_Player': return 8;
+        case 'SE_Prison_CellGrabber_hero': return 9;
+        case 'SE_SqueezeThrow_Player': return 10;
+        case 'SE_SecurityRoom_SitDown_Player': return 11;
+        case 'SE_SecurityRoom_WaitCycle_Player': return 12;
+        case 'SE_SecurityRoom_GetUp_Player': return 13;
+        case 'SE_AdminBlock_IntroMiles_p2_handycam': return 14;
+        case 'SE_AdminBlock_PriestDrugsMiles_handycam': return 15;
+        case 'SE_Prison_MilesWakeUp': return 16;
+        case 'SE_Prison_Miles_SASExplosion': return 17;
+        case 'SE_Prison_CellGrabber_V2_hero': return 18;
+        case 'SE_MaleWard_Torture_p1_hero': return 19;
+        case 'SE_MaleWard_Torture_p2_hero': return 20;
+        case 'SE_MaleWard_Torture_p3_hero': return 21;
+        case 'SE_MaleWard_Torture_p4_hero': return 22;
+        case 'SE_MaleWard_Torture_p5_hero': return 23;
+        case 'SE_MaleWard_Torture_p6_hero_end': return 24;
+        case 'SE_MaleWard_Torture_p6_hero_struggleCYCLE': return 25;
+        case 'SE_MaleWard_Torture_p6_hero_struggleENTER': return 26;
+        case 'SE_MaleWard_Torture_p6_hero_struggleEXIT': return 27;
+        case 'SE_MaleWard_ElevatorFight_p2_hero': return 28;
+        case 'SE_PyroStruggle_player_enter': return 29;
+        case 'SE_PyroStruggle_player_exit': return 30;
+        case 'SE_PyroStruggle_player_loop': return 31;
+        case 'SE_PyroStruggle_player_fail': return 32;
+        case 'SE_PyroStruggle_V2_hero': return 33;
+        case 'SE_ReceptionHall_Rise_Player': return 34;
+        case 'SE_SecurityRoom_Ending_Player': return 35;
+        case 'SE_PatientSurpriseAttack_hero_cycle': return 36;
+        case 'SE_PatientSurpriseAttack_hero_entry': return 37;
+        case 'SE_PatientSurpriseAttack_hero_exit': return 38;
+        case 'Player_End': return 39;
+        case 'SE_Prison_CellGrabber_Struggle_player_cycle': return 40;
+        case 'SE_Prison_CellGrabber_Struggle_player_entry': return 41;
+        case 'SE_Prison_CellGrabber_Struggle_player_exit': return 42;
+        case 'SE_FemaleWard_Fall_hero': return 43;
+        case 'SE_Prison_CellGrabber_Struggle_player_fail': return 44;
+        case 'SE_PatientSurpriseAttack_player_fail': return 45;
+        case 'SE_PatientSurpriseAttack_V2_hero': return 46;
+        case 'SE_FemaleWard_BumpInTheDark_Player': return 47;
+        case 'SE_SwarmKillsSoldier_hero': return 48;
+        case 'SE_Lab_SwarmThrowDown': return 49;
+        case 'SE_Lab_FinaleV2_p1_hero_old': return 50;
+        case 'SE_Lab_FinaleV2_p2_hero_Death': return 51;
+        case 'SE_Lab_FinaleV3_p1_hero': return 52;
+        case 'SE_Lab_FinaleV3_1stStumble_hero': return 53;
+        case 'SE_Lab_FinaleV3_2ndStumble_hero': return 54;
+        case 'SE_Lab_FinaleV3_3rdStumble_hero': return 55;
+        default: return 0;
+    }
+}
+
 event PlayerTick(float DeltaTime)
 {
     local string Packet;
@@ -532,8 +640,16 @@ event PlayerTick(float DeltaTime)
             ExtraKind = 0;
             if (MyHero != None)
             {
-                ExtraState = int(MyHero.bLeftAnim);
-                ExtraKind = int(MyHero.ActiveLedgeTransitionType);
+                // When in cinematic mode, send the cutscene animation ID via ExtraState
+                if (MyHero.LocomotionMode == 9) // LM_Cinematic
+                {
+                    ExtraState = GetCutsceneAnimId(MyHero);
+                }
+                else
+                {
+                    ExtraState = int(MyHero.bLeftAnim);
+                    ExtraKind = int(MyHero.ActiveLedgeTransitionType);
+                }
             }
 
             Packet = "LOC,"
@@ -551,7 +667,8 @@ event PlayerTick(float DeltaTime)
                 $ (MyHero != None ? int(MyHero.bRunningTraversalMove) : 0) $ ","
                 $ (MyHero != None ? int(MyHero.bPlayingSpecialMoveAnim) : 0) $ ","
                 $ GetDoorAnimRatio(MyHero) $ ","
-                $ GetDoorSyncId(MyHero) $ "," $ GetDoorSyncOpenRatio(MyHero);
+                $ GetDoorSyncId(MyHero) $ "," $ GetDoorSyncOpenRatio(MyHero) $ ","
+                $ Pawn.Rotation.Pitch $ "," $ Pawn.Rotation.Yaw;
 
             ConnectionLink.SendText(Packet $ "\n");
         }
@@ -900,7 +1017,7 @@ function OnReceiveData(string Data)
 {
     local array<string> F;
     local vector IL, IV;
-    local rotator IR;
+    local rotator IR, MeshRot;
     local bool BC, CC, bRunning, bPlayingAnim;
     local int CS, LM, SM, DD, LD, ED, ET, HP, FromCid, RIdx;
     local float SMs, NMs, TS, DoorRatio, DoorSyncOpenRatio;
@@ -963,6 +1080,17 @@ function OnReceiveData(string Data)
 
     if (Left(Data, 6) == "NOTIF,") { AddNotification(Right(Data, Len(Data) - 6)); return; }
     if (Left(Data, 5) == "SRUN,") { HandleSpeedrunPacket(Data); return; }
+    
+    // Handle player leaving - destroy their pawn and controller
+    if (Left(Data, 5) == "LEFT,")
+    {
+        F = SplitString(Data, ",", true);
+        if (F.Length >= 2)
+        {
+            DestroyRemotePlayer(int(F[1]));
+        }
+        return;
+    }
 
     if (Left(Data, 5) == "TALK,")
     {
@@ -1019,6 +1147,11 @@ function OnReceiveData(string Data)
     // Door sync fields (fields 23, 24)
     DoorSyncId = (F.Length >= 24) ? int(F[23]) : 0;
     DoorSyncOpenRatio = (F.Length >= 25) ? float(F[24]) : -1.0;
+    
+    // Mesh rotation fields (fields 25, 26) - pawn body rotation separate from camera rotation
+    MeshRot.Pitch = (F.Length >= 27) ? int(F[25]) : IR.Pitch;
+    MeshRot.Yaw = (F.Length >= 27) ? int(F[26]) : IR.Yaw;
+    MeshRot.Roll = 0;
 
     RemotePlayers[RIdx].Health = HP;
 
@@ -1029,6 +1162,7 @@ function OnReceiveData(string Data)
         {
             RemoteV2.AddState(TS, IL, IR, IV, CC, BC, CS, LM, SM, DD, LD, ED, ET, HP, bRunning, bPlayingAnim, DoorRatio);
             RemoteV2.SyncDoorState(DoorSyncId, DoorSyncOpenRatio);
+            RemoteV2.SetMeshRotation(MeshRot);
         }
     }
 }

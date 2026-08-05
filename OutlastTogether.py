@@ -1307,12 +1307,15 @@ async def _run_tcp_bridge(app, host, port, room):
         wake(client)
 
     def broadcast(line, exclude=None):
-        data = (line.rstrip("\n") + "\n").encode("utf-8")
         exclude_cid = exclude.cid if exclude else None
         counters["relayed"] += 1
         for client in clients.values():
             if client.cid == exclude_cid or client.closing:
                 continue
+            if exclude_cid is not None:
+                data = f"FROM,{exclude_cid},{line.rstrip(chr(10))}\n".encode("utf-8")
+            else:
+                data = (line.rstrip("\n") + "\n").encode("utf-8")
             enqueue(client, data)
 
     def send_to(client, line):
@@ -1345,6 +1348,7 @@ async def _run_tcp_bridge(app, host, port, room):
         clients[client.cid] = client
         client.writer_task = loop.create_task(client_writer(client))
         app.log(f"Connected: {address} (assigned {client.label})")
+        send_to(client, f"YOUR_CID,{client.cid}")
         refresh_roster()
         buffer = b""
         try:
@@ -1400,6 +1404,7 @@ async def _run_tcp_bridge(app, host, port, room):
             await client.writer.wait_closed()
         except Exception:
             pass
+        broadcast(f"LEFT,{client.cid}")
         broadcast(f"NOTIF,{client.label} left the room.")
         refresh_roster()
 
@@ -2852,12 +2857,15 @@ class HeadlessRelay:
             wake(client)
 
         def broadcast(line, exclude=None):
-            data = (line.rstrip("\n") + "\n").encode("utf-8")
             exclude_cid = exclude.cid if exclude else None
             counters["relayed"] += 1
             for client in clients.values():
                 if client.cid == exclude_cid or client.closing:
                     continue
+                if exclude_cid is not None:
+                    data = f"FROM,{exclude_cid},{line.rstrip(chr(10))}\n".encode("utf-8")
+                else:
+                    data = (line.rstrip("\n") + "\n").encode("utf-8")
                 enqueue(client, data)
 
         def send_to(client, line):
@@ -2892,6 +2900,7 @@ class HeadlessRelay:
             clients[client.cid] = client
             client.writer_task = loop.create_task(client_writer(client))
             log_msg("%s connected (assigned %s)", address, client.label)
+            send_to(client, f"YOUR_CID,{client.cid}")
             status()
             buffer = b""
             try:
@@ -2947,6 +2956,7 @@ class HeadlessRelay:
                 await client.writer.wait_closed()
             except Exception:
                 pass
+            broadcast(f"LEFT,{client.cid}")
             broadcast(f"NOTIF,{client.label} left the room.")
             log_msg("%s disconnected", client.label)
             status()

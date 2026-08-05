@@ -80,6 +80,7 @@ var float EmojiBtnX, EmojiBtnY, EmojiBtnS;
 // mouse X position to a caret index in the chat text.
 var float ChatInputX, ChatInputY, ChatInputW, ChatInputH;
 var float ChatInputScroll;      // horizontal pixel scroll of the input text
+var float ChatInputEmojiSize;   // emoji tile size captured from DrawChat for hit-testing
 var bool  bChatSelectingDrag;   // mouse button held and dragging a selection
 var float LastCaretMoveTime;    // resets the caret blink so it stays solid while editing
 
@@ -882,8 +883,8 @@ function DrawChatPanel(OLTogetherController PC)
         if (CaretIdx > Len(PC.ChatText))
             CaretIdx = Len(PC.ChatText);
 
-        FullTextW = MeasureW("> " $ PC.ChatText, FontBody);
-        CaretX = MeasureW("> " $ Left(PC.ChatText, CaretIdx), FontBody);
+        FullTextW = MeasureRichW("> " $ PC.ChatText, FontBody, LineH);
+        CaretX = MeasureRichW("> " $ Left(PC.ChatText, CaretIdx), FontBody, LineH);
 
         HScroll = ChatInputScroll;
         if (CaretX - HScroll > TextAreaW - 4.0 * UIScale)
@@ -898,6 +899,7 @@ function DrawChatPanel(OLTogetherController PC)
         ChatInputY = CY;
         ChatInputW = TextAreaW;
         ChatInputH = LineH;
+        ChatInputEmojiSize = LineH;
 
         Canvas.PushMaskRegion(CX, CY - 2.0 * UIScale, TextAreaW, LineH + 4.0 * UIScale);
 
@@ -905,12 +907,12 @@ function DrawChatPanel(OLTogetherController PC)
         SelB = ChatSelMaxIdx(PC);
         if (SelA != SelB)
         {
-            SelStartX = CX + MeasureW("> " $ Left(PC.ChatText, SelA), FontBody) - HScroll;
-            SelEndX = CX + MeasureW("> " $ Left(PC.ChatText, SelB), FontBody) - HScroll;
+            SelStartX = CX + MeasureRichW("> " $ Left(PC.ChatText, SelA), FontBody, LineH) - HScroll;
+            SelEndX = CX + MeasureRichW("> " $ Left(PC.ChatText, SelB), FontBody, LineH) - HScroll;
             DrawFilledBox(SelStartX, CY - 1.0 * UIScale, SelEndX - SelStartX, LineH + 2.0 * UIScale, 60, 100, 180, byte(140.0 * GA));
         }
 
-        DrawLabel("> " $ PC.ChatText, CX - HScroll, CY, FontBody, 225, 227, 235, byte(255.0 * GA));
+        DrawRichLine("> " $ PC.ChatText, CX - HScroll, CY, FontBody, LineH, 225, 227, 235, byte(255.0 * GA));
 
         bCaretOn = (int((WorldInfo.TimeSeconds - LastCaretMoveTime) * 2.0) % 2 == 0);
         if (bCaretOn)
@@ -1207,7 +1209,7 @@ function int ChatHitTestCaret(OLTogetherController PC, float ScreenX)
     PrevX = 0.0;
     for (I = 0; I <= N; I++)
     {
-        CharX = X + MeasureW(Prefix $ Left(PC.ChatText, I), 0.72 * UIScale) - HScroll;
+        CharX = X + MeasureRichW(Prefix $ Left(PC.ChatText, I), 0.72 * UIScale, ChatInputEmojiSize) - HScroll;
         if (I > 0 && ScreenX < (PrevX + CharX) * 0.5)
             return I - 1;
         PrevX = CharX;

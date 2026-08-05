@@ -7,7 +7,6 @@ var OLTogetherNetworkState NetworkState;
 // Interpolation state
 var float TeleportDistThreshold;
 var float InterpSpeed;
-var float RotInterpSpeed;
 var bool bHasState;
 
 // Current rendered state
@@ -15,6 +14,7 @@ var int CurrentLocomotionMode;
 var int CurrentSpecialMove;
 var int CurrentDoorDir;
 var int CurrentLeanDir;
+var bool bCurrentLeftAnim;     // Left/right anim variant from host (via ExtraData)
 var int CurrentExtraData;
 var int CurrentExtraKind;
 var bool bCurrentCrouched;
@@ -41,6 +41,8 @@ var bool bWaitingForInstantVault;
 var int PendingVaultMoveType;
 var bool bPendingVaultRunning;
 var float InstantVaultDelayTime;
+var bool bLedgeIdleStarted;  // Track if ledge idle was started early during grab anim
+var bool bBedIdleStarted;    // Track if bed idle was started early during enter bed anim
 
 // Crouch transition tracking
 var bool bPlayingCrouchTransition;
@@ -48,6 +50,12 @@ var float CrouchTransitionStartTime;
 var float CrouchTransitionDuration;
 var float AnimLockEndTime;  // From original: prevents idle system from overriding transition
 var name LastMovementAnim;  // From original: tracks current movement anim to avoid redundant swaps
+
+// Cutscene animation tracking
+var int CurrentCutsceneAnim;  // ID of the current cutscene animation
+var bool bPlayingCutscene;    // Whether a cutscene animation is currently playing
+var rotator MeshRotation;     // Pawn body rotation (separate from camera rotation)
+var rotator DesiredMeshRotation; // Target mesh rotation from network
 
 // SM re-trigger prevention
 var int LastEndedSpecialMove;
@@ -64,6 +72,100 @@ var vector PredictedLocation;
 var int PredictedYaw;
 var int LastReceivedYaw;
 var float LastStateUpdateTime;
+
+// Map cutscene animation ID to animation name
+function name GetCutsceneAnimName(int CutsceneID)
+{
+    switch (CutsceneID)
+    {
+        case 1: return 'SE_AdminBlock_IntroMiles_p1_hero';
+        case 2: return 'SE_AdminBlock_IntroMiles_p2_hero';
+        case 3: return 'SE_AdminBlock_PriestDrugsMiles_hero';
+        case 4: return 'SE_AdminBlockRv_AirventPushCorpse_hero';
+        case 5: return 'SE_Miles_PriestIntro_01';
+        case 6: return 'SE_Miles_PriestIntro_OnTheFloor_01';
+        case 7: return 'SE_Miles_PriestIntro_StandingUp_01';
+        case 8: return 'SE_PatientAttack_Player';
+        case 9: return 'SE_Prison_CellGrabber_hero';
+        case 10: return 'SE_SqueezeThrow_Player';
+        case 11: return 'SE_SecurityRoom_SitDown_Player';
+        case 12: return 'SE_SecurityRoom_WaitCycle_Player';
+        case 13: return 'SE_SecurityRoom_GetUp_Player';
+        case 14: return 'SE_AdminBlock_IntroMiles_p2_handycam';
+        case 15: return 'SE_AdminBlock_PriestDrugsMiles_handycam';
+        case 16: return 'SE_Prison_MilesWakeUp';
+        case 17: return 'SE_Prison_Miles_SASExplosion';
+        case 18: return 'SE_Prison_CellGrabber_V2_hero';
+        case 19: return 'SE_MaleWard_Torture_p1_hero';
+        case 20: return 'SE_MaleWard_Torture_p2_hero';
+        case 21: return 'SE_MaleWard_Torture_p3_hero';
+        case 22: return 'SE_MaleWard_Torture_p4_hero';
+        case 23: return 'SE_MaleWard_Torture_p5_hero';
+        case 24: return 'SE_MaleWard_Torture_p6_hero_end';
+        case 25: return 'SE_MaleWard_Torture_p6_hero_struggleCYCLE';
+        case 26: return 'SE_MaleWard_Torture_p6_hero_struggleENTER';
+        case 27: return 'SE_MaleWard_Torture_p6_hero_struggleEXIT';
+        case 28: return 'SE_MaleWard_ElevatorFight_p2_hero';
+        case 29: return 'SE_PyroStruggle_player_enter';
+        case 30: return 'SE_PyroStruggle_player_exit';
+        case 31: return 'SE_PyroStruggle_player_loop';
+        case 32: return 'SE_PyroStruggle_player_fail';
+        case 33: return 'SE_PyroStruggle_V2_hero';
+        case 34: return 'SE_ReceptionHall_Rise_Player';
+        case 35: return 'SE_SecurityRoom_Ending_Player';
+        case 36: return 'SE_PatientSurpriseAttack_hero_cycle';
+        case 37: return 'SE_PatientSurpriseAttack_hero_entry';
+        case 38: return 'SE_PatientSurpriseAttack_hero_exit';
+        case 39: return 'Player_End';
+        case 40: return 'SE_Prison_CellGrabber_Struggle_player_cycle';
+        case 41: return 'SE_Prison_CellGrabber_Struggle_player_entry';
+        case 42: return 'SE_Prison_CellGrabber_Struggle_player_exit';
+        case 43: return 'SE_FemaleWard_Fall_hero';
+        case 44: return 'SE_Prison_CellGrabber_Struggle_player_fail';
+        case 45: return 'SE_PatientSurpriseAttack_player_fail';
+        case 46: return 'SE_PatientSurpriseAttack_V2_hero';
+        case 47: return 'SE_FemaleWard_BumpInTheDark_Player';
+        case 48: return 'SE_SwarmKillsSoldier_hero';
+        case 49: return 'SE_Lab_SwarmThrowDown';
+        case 50: return 'SE_Lab_FinaleV2_p1_hero_old';
+        case 51: return 'SE_Lab_FinaleV2_p2_hero_Death';
+        case 52: return 'SE_Lab_FinaleV3_p1_hero';
+        case 53: return 'SE_Lab_FinaleV3_1stStumble_hero';
+        case 54: return 'SE_Lab_FinaleV3_2ndStumble_hero';
+        case 55: return 'SE_Lab_FinaleV3_3rdStumble_hero';
+        default: return 'None';
+    }
+}
+
+// Play cutscene animation on remote hero
+function PlayCutsceneAnimation(int CutsceneID)
+{
+    local name AnimName;
+    
+    if (RemoteHero == None || RemoteHero.ShadowProxyFullBodyAnimSlot == None)
+        return;
+    
+    AnimName = GetCutsceneAnimName(CutsceneID);
+    if (AnimName == 'None')
+    {
+        `log("[CUTSCENE_ERROR] Unknown cutscene ID:" @ CutsceneID);
+        return;
+    }
+    
+    `log("[CUTSCENE_PLAY] Playing cutscene animation:" @ AnimName @ "ID:" @ CutsceneID @ "Time:" @ WorldInfo.TimeSeconds);
+    
+    // Play the cutscene animation (non-looping, controlled by Matinee timeline on host)
+    RemoteHero.ShadowProxyFullBodyAnimSlot.PlayCustomAnim(AnimName, 1.0, 0.1, 0.1, false, false);
+    bPlayingCutscene = true;
+}
+
+// Set mesh rotation from network (body rotation, separate from camera rotation)
+function SetMeshRotation(rotator NewMeshRotation)
+{
+    DesiredMeshRotation = NewMeshRotation;
+    DesiredMeshRotation.Pitch = 0;
+    DesiredMeshRotation.Roll = 0;
+}
 
 function Possess(Pawn inPawn, bool bVehicleTransition)
 {
@@ -246,6 +348,8 @@ function PlaySpecialMoveAnim(int MoveType, bool bRunning)
     AnimDuration = 1.0;
     bPositionLocked = false;
     bLockRotation = true;
+    bLedgeIdleStarted = false;
+    bBedIdleStarted = false;
     DoorDir = CurrentDoorDir;
     
     switch (MoveType)
@@ -631,6 +735,190 @@ function PlaySpecialMoveAnim(int MoveType, bool bRunning)
             bPositionLocked = false;
             break;
             
+        // === LOCKER ===
+        case 37: // SMT_OpenLockerFromOutside
+            // OLHero.cpp line 1143-1153: PlayBlendedAnim(Straight, 45Left/Right, alpha, 0.25, 0.5)
+            AnimName = bIsLeft ? 'player_locker_open_left_45' : 'player_locker_open_right_45';
+            AnimDuration = 1.58;
+            BlendIn = 0.25;
+            BlendOut = 0.5;
+            bPositionLocked = false;
+            break;
+            
+        case 38: // SMT_EnterLocker
+            // OLHero.cpp line 1155-1158: PlayFullBodyAnim(AnimNameHideInLocker, 1.f, 0.25f, 0.25f)
+            AnimName = 'player_locker_hide';
+            AnimDuration = 3.46;
+            BlendIn = 0.25;
+            BlendOut = 0.25;
+            bPositionLocked = false;
+            break;
+            
+        case 39: // SMT_ExitLocker
+            // OLHero.cpp: exit locker animation
+            AnimName = 'player_locker_exit';
+            AnimDuration = 1.25;
+            BlendIn = 0.25;
+            BlendOut = 0.25;
+            bPositionLocked = false;
+            break;
+            
+        // === BED ===
+        // OLHero.cpp line 1176-1199: left/right, crouched/standing variants
+        // Gap fix: start bed_idle early to bridge gap before locomotion mode changes
+        case 40: // SMT_EnterBed
+            if (bCurrentLeftAnim)
+                AnimName = bCurrentCrouched ? 'player_enter_bed_left' : 'player_enter_bed_left_stand';
+            else
+                AnimName = bCurrentCrouched ? 'player_enter_bed_right' : 'player_enter_bed_right_stand';
+            AnimDuration = bCurrentCrouched ? 1.1667 : 1.5;
+            BlendIn = 0.25;
+            BlendOut = 0.15;
+            bPositionLocked = false;
+            break;
+            
+        case 41: // SMT_ExitBed
+            if (bCurrentLeftAnim)
+                AnimName = bCurrentCrouched ? 'player_exit_bed_left_crouch' : 'player_exit_bed_left';
+            else
+                AnimName = bCurrentCrouched ? 'player_exit_bed_right_crouch' : 'player_exit_bed_right';
+            AnimDuration = bCurrentCrouched ? 1.6 : 2.0;
+            BlendIn = 0.25;
+            BlendOut = 0.5;
+            bPositionLocked = false;
+            break;
+            
+        // === LADDER ===
+        case 43: // SMT_EnterLadderFromGround
+            // OLHero.cpp line 830-842: PlayBlendedAnim(Straight, 45Left/Right, alpha, 0.25, 0.05)
+            AnimName = 'player_ladder_grab_straight';
+            AnimDuration = 0.83;
+            BlendIn = 0.25;
+            BlendOut = 0.05;
+            bPositionLocked = false;
+            break;
+            
+        case 44: // SMT_EnterLadderFromAbove
+            // OLHeroData.uci: AnimName=player_ladder_enter_above
+            AnimName = 'player_ladder_enter_above';
+            AnimDuration = 3.33;
+            BlendIn = 0.25;
+            BlendOut = 0.5;
+            bPositionLocked = false;
+            break;
+            
+        case 45: // SMT_ExitLadderOnGround
+            // Just release the ladder, no specific hero anim - use brief exit
+            AnimName = 'player_ladder_grab_straight';
+            AnimDuration = 0.83;
+            BlendIn = 0.25;
+            BlendOut = 0.25;
+            bPositionLocked = false;
+            break;
+            
+        case 46: // SMT_ExitLadderOnTop
+            // OLHero.cpp line 843-853: PlayFullBodyAnim(ExitLadderOnTopLH/RH, 1.f, 0.25f, 0.5f)
+            AnimName = 'player_ladder_exit_lh';
+            AnimDuration = 2.88;
+            BlendIn = 0.25;
+            BlendOut = 0.5;
+            bPositionLocked = false;
+            break;
+            
+        case 47: // SMT_DropFromLadder
+            AnimName = 'player_falling_loop';
+            AnimDuration = 1.0;
+            BlendIn = 0.1;
+            BlendOut = 0.25;
+            bPositionLocked = false;
+            break;
+            
+        case 48: // SMT_GrabLadderFromAir
+            // OLHeroData.uci: AnimName=player_ladder_grab_from_air
+            AnimName = 'player_ladder_grab_from_air';
+            AnimDuration = 0.33;
+            BlendIn = 0.1;
+            BlendOut = 0.25;
+            bPositionLocked = false;
+            break;
+            
+        // === PICKUP OBJECT ===
+        case 49: // SMT_PickupObject
+            // OLHero.cpp line 856-939: BlendSpace for document vs object, standing vs crouched
+            // Use middle blend for remote - most common pickup
+            AnimName = 'player_object_pickup_h62v105';
+            AnimDuration = 1.25;
+            BlendIn = 0.25;
+            BlendOut = 0.25;
+            bPositionLocked = false;
+            break;
+            
+        // === CSA (Context Sensitive Action) ===
+        case 50: // SMT_CSA
+            // OLHero.cpp line 942-948: PlayFullBodyAnim(ActiveCSA->AnimName, 1.f, 0.25f, 0.5f)
+            // CSA uses dynamic animation name from the CSA actor - we can't know it in advance
+            // Use a generic pickup animation as fallback
+            AnimName = 'player_object_pickup_h62v105';
+            AnimDuration = 1.25;
+            BlendIn = 0.25;
+            BlendOut = 0.5;
+            bPositionLocked = false;
+            break;
+            
+        // === PUSH OBJECT ===
+        case 54: // SMT_StartPushingObject
+            // OLHero.cpp line 1303-1306: PlayFullBodyAnim(EnterPushObjectLeft/Right, 1.0f, 0.25f, 0.25f)
+            AnimName = 'player_push_object_enter_left';
+            AnimDuration = 0.83;
+            BlendIn = 0.25;
+            BlendOut = 0.25;
+            bPositionLocked = false;
+            break;
+            
+        case 55: // SMT_StopPushingObject
+            // OLHero.cpp line 1308-1311: PlayFullBodyAnim(ExitPushObjectLeft/Right, 1.0f, 0.25f, 0.5f)
+            AnimName = 'player_push_object_exit_left';
+            AnimDuration = 1.25;
+            BlendIn = 0.25;
+            BlendOut = 0.5;
+            bPositionLocked = false;
+            break;
+            
+        // === PUSH FROM LEDGE ===
+        case 56: // SMT_PushFromLedgeProcedural
+        case 57: // SMT_PushFromLedgeAnimated
+            // OLHero.cpp: pushaway animations
+            AnimName = 'player_pushaway_left';
+            AnimDuration = 1.04;
+            BlendIn = 0.1;
+            BlendOut = 0.25;
+            bPositionLocked = false;
+            break;
+            
+        // === CONTEXTUAL LEAN ===
+        // Lean is driven by the animation tree via CurrentLean, not by special move animations.
+        // These SMs just transition locomotion mode — no specific full-body anim needed.
+        case 58: // SMT_EnterContextualLean
+        case 59: // SMT_ExitContextualLean
+        case 60: // SMT_ExitContextualLeanForward
+        case 61: // SMT_ContextualLeanInsideTransition
+            AnimName = 'None';
+            AnimDuration = 0.5;
+            BlendIn = 0.1;
+            BlendOut = 0.25;
+            bPositionLocked = false;
+            break;
+            
+        // === HERO GRABBED (player_hit) ===
+        case 62: // SMT_HeroGrabbedNormal
+            // OLHero.cpp line 1313-1351: PlayBlendedAnim(GrabNormal/Left90/Right90/etc, alpha, 0.1f, 0.5f)
+            AnimName = 'player_hit_forward';
+            AnimDuration = 1.375;
+            BlendIn = 0.1;
+            BlendOut = 0.5;
+            bPositionLocked = false;
+            break;
+            
         default:
             return;
     }
@@ -643,9 +931,9 @@ function PlaySpecialMoveAnim(int MoveType, bool bRunning)
         RemoteHero.ShadowProxyFullBodyAnimSlot.StopCustomAnim(0.0);
         bPlayingCrouchTransition = false;
     }
-    `log("[ANIM_BEFORE] bPlayingSpecialAnim:" @ bPlayingSpecialAnim @ "CurrentSM:" @ CurrentSpecialMove @ "Time:" @ WorldInfo.TimeSeconds);
+    `log("[ANIM_BEFORE] bPlayingSpecialAnim:" @ bPlayingSpecialAnim @ "CurrentSM:" @ CurrentSpecialMove @ "Slot:" @ (RemoteHero.ShadowProxyFullBodyAnimSlot != None) @ "Time:" @ WorldInfo.TimeSeconds);
     RemoteHero.ShadowProxyFullBodyAnimSlot.PlayCustomAnim(AnimName, 1.0, BlendIn, BlendOut, false, false);
-    `log("[ANIM_PLAY] Played:" @ AnimName @ "BlendIn:" @ BlendIn @ "BlendOut:" @ BlendOut @ "Duration:" @ AnimDuration @ "SM:" @ MoveType @ "Time:" @ WorldInfo.TimeSeconds);
+    `log("[ANIM_PLAY] Played:" @ AnimName @ "BlendIn:" @ BlendIn @ "BlendOut:" @ BlendOut @ "Duration:" @ AnimDuration @ "SM:" @ MoveType @ "SlotAnim:" @ RemoteHero.ShadowProxyFullBodyAnimSlot.GetPlayedAnimation() @ "Time:" @ WorldInfo.TimeSeconds);
     bPlayingSpecialAnim = true;
     SpecialAnimStartTime = WorldInfo.TimeSeconds;
     SpecialAnimDuration = AnimDuration;
@@ -657,7 +945,7 @@ function EndSpecialMoveAnim()
 {
     if (RemoteHero == None) return;
     
-    `log("[ANIM_END] Stopping anim, SM:" @ CurrentSpecialMove @ "was playing for:" @ (WorldInfo.TimeSeconds - SpecialAnimStartTime) @ "Time:" @ WorldInfo.TimeSeconds);
+    `log("[ANIM_END] Stopping anim, SM:" @ CurrentSpecialMove @ "was playing for:" @ (WorldInfo.TimeSeconds - SpecialAnimStartTime) @ "CurrentAnim:" @ RemoteHero.ShadowProxyFullBodyAnimSlot.GetPlayedAnimation() @ "bPlayingSpecialAnim:" @ bPlayingSpecialAnim @ "Time:" @ WorldInfo.TimeSeconds);
     bPlayingSpecialAnim = false;
     bPositionLocked = false;
     bDoorAnimFlipped = false;
@@ -669,7 +957,10 @@ function EndSpecialMoveAnim()
     
     // Stop with 0.1s blend (from OLHero::PlayFullBodyAnim line 8540)
     if (RemoteHero.ShadowProxyFullBodyAnimSlot != None)
+    {
         RemoteHero.ShadowProxyFullBodyAnimSlot.StopCustomAnim(0.1);
+        `log("[ANIM_END_STOP] StopCustomAnim(0.1) called. Time:" @ WorldInfo.TimeSeconds);
+    }
 }
 
 event Tick(float DeltaTime)
@@ -678,9 +969,8 @@ event Tick(float DeltaTime)
     local OLTogetherNetworkState.CompactState Before, After, Desired;
     local float Alpha, MoveDist, ElapsedAnimTime;
     local vector MoveDelta, ProjectedLoc, InterpLoc;
-    local rotator DesiredRot, InterpRot;
+    local rotator DesiredRot;
     local bool bHostEndedSpecialMove, bIsVault;
-    local int RotDiff;
     
     if (!bHasState || NetworkState == None || NetworkState.StateBuffer.Length == 0 || RemoteHero == None)
         return;
@@ -692,7 +982,7 @@ event Tick(float DeltaTime)
         return;
     
     // Hermite interpolation for smoother movement (uses velocity for curved path)
-    Desired.Location = NetworkState.HermiteInterp(Before.Location, Before.Velocity, After.Location, After.Velocity, Alpha);
+    Desired.Location = NetworkState.HermiteInterp(Before.Location, Before.Velocity, After.Location, After.Velocity, Alpha, FMax(After.TimeStamp - Before.TimeStamp, 0.0001));
     Desired.Velocity = VLerp(Before.Velocity, After.Velocity, Alpha);
     Desired.Yaw = NetworkState.CubicRotationInterp(Before.Yaw, After.Yaw, Alpha);
     
@@ -721,11 +1011,29 @@ event Tick(float DeltaTime)
     if (bPlayingSpecialAnim)
     {
         ElapsedAnimTime = WorldInfo.TimeSeconds - SpecialAnimStartTime;
-        // SM 14 (GrabLedgeFromGround) and SM 15 (GrabLedgeFromAir) need to stay active
-        // until locomotion mode transitions to LM_LedgeHang (4), not just duration expiry
+        // SM 14 (GrabLedgeFromGround) and SM 15 (GrabLedgeFromAir) need special handling
+        // The grab anim is 1s, but we need to start the ledge idle BEFORE it ends to avoid gap
         if (CurrentSpecialMove == 14 || CurrentSpecialMove == 15)
         {
-            bHostEndedSpecialMove = (Desired.LocomotionMode == 4);
+            `log("[LEDGE_GRAB_TICK] SM:" @ CurrentSpecialMove @ "Elapsed:" @ ElapsedAnimTime @ "Duration:" @ SpecialAnimDuration @ "LM_desired:" @ Desired.LocomotionMode @ "LM_current:" @ CurrentLocomotionMode @ "bPlayingAnim:" @ bPlayingSpecialAnim @ "bLedgeIdleStarted:" @ bLedgeIdleStarted @ "Time:" @ WorldInfo.TimeSeconds);
+            
+            // Start ledge idle at 0.75s (before the 1s grab anim ends) to bridge the gap
+            if (!bLedgeIdleStarted && ElapsedAnimTime > 0.75 && RemoteHero.ShadowProxyFullBodyAnimSlot != None)
+            {
+                `log("[LEDGE_GRAB_BRIDGE] Starting player_ledge_idle early at" @ ElapsedAnimTime @ "to bridge gap. Time:" @ WorldInfo.TimeSeconds);
+                RemoteHero.ShadowProxyFullBodyAnimSlot.PlayCustomAnim('player_ledge_idle', 1.0, 0.25, 0.0, true, false);
+                bLedgeIdleStarted = true;
+            }
+            
+            // End when the animation duration is complete OR host explicitly ends
+            bHostEndedSpecialMove = (Desired.SpecialMove == 0 && CurrentSpecialMove != 0)
+                || (ElapsedAnimTime > SpecialAnimDuration - 0.1);
+        }
+        // SM 40 (EnterBed) - fall through to locomotion update same as ledge
+        else if (CurrentSpecialMove == 40)
+        {
+            bHostEndedSpecialMove = (Desired.SpecialMove == 0 && CurrentSpecialMove != 0)
+                || (ElapsedAnimTime > SpecialAnimDuration - 0.1);
         }
         else
         {
@@ -743,17 +1051,45 @@ event Tick(float DeltaTime)
         
         if (bHostEndedSpecialMove)
         {
-            // For ledge grab SMs, immediately start ledge idle to avoid default pose gap
+            `log("[SM_END] SM:" @ CurrentSpecialMove @ "LM_desired:" @ Desired.LocomotionMode @ "LM_current:" @ CurrentLocomotionMode @ "Elapsed:" @ (WorldInfo.TimeSeconds - SpecialAnimStartTime) @ "Time:" @ WorldInfo.TimeSeconds);
+            // For ledge grab and bed enter SMs: reset state but DON'T return early
+            // Let the locomotion mode update happen in the same frame to avoid 1-frame gap
             if (CurrentSpecialMove == 14 || CurrentSpecialMove == 15)
             {
-                `log("[ANIM_LEDGE_GRAB_END] SM:" @ CurrentSpecialMove @ "Transitioning to ledge idle Time:" @ WorldInfo.TimeSeconds);
-                if (RemoteHero.ShadowProxyFullBodyAnimSlot != None)
-                    RemoteHero.ShadowProxyFullBodyAnimSlot.PlayCustomAnim('player_ledge_idle', 1.0, 0.05, 0.0, true, false);
+                `log("[SM_FALLTHROUGH_END] SM:" @ CurrentSpecialMove @ "Time:" @ WorldInfo.TimeSeconds);
+                bPlayingSpecialAnim = false;
+                bPositionLocked = false;
+                bLockRotation = true;
+                bDoorAnimFlipped = false;
+                bWaitingForInstantVault = false;
+                PendingVaultMoveType = 0;
+                bPendingVaultRunning = false;
+                CurrentSpecialMove = 0;
+                InstantVaultDelayTime = 0.0;
+                // Don't return - fall through to locomotion mode update below
             }
-            EndSpecialMoveAnim();
-            PredictedLocation = RemoteHero.Location;
-            PredictedYaw = RemoteHero.Rotation.Yaw;
-            return;
+            // Bed enter: same fall-through but DON'T reset CurrentSpecialMove
+            // so next frame doesn't re-trigger as a "new" SM 40
+            else if (CurrentSpecialMove == 40)
+            {
+                `log("[SM_BED_FALLTHROUGH] SM:40 Time:" @ WorldInfo.TimeSeconds);
+                bPlayingSpecialAnim = false;
+                bPositionLocked = false;
+                bLockRotation = true;
+                bWaitingForInstantVault = false;
+                PendingVaultMoveType = 0;
+                bPendingVaultRunning = false;
+                InstantVaultDelayTime = 0.0;
+                // Keep CurrentSpecialMove = 40 so next frame sees it as same SM, not new
+                // Don't return - fall through to locomotion mode update below
+            }
+            else
+            {
+                EndSpecialMoveAnim();
+                PredictedLocation = RemoteHero.Location;
+                PredictedYaw = RemoteHero.Rotation.Yaw;
+                return;
+            }
         }
         else if (bPositionLocked)
         {
@@ -838,7 +1174,8 @@ event Tick(float DeltaTime)
     }
     
     // Compute desired rotation early - needed by position locking code below
-    DesiredRot.Yaw = Desired.Yaw;
+    // Use mesh rotation (body facing direction) instead of camera rotation
+    DesiredRot = DesiredMeshRotation;
     DesiredRot.Pitch = 0;
     DesiredRot.Roll = 0;
     
@@ -849,42 +1186,30 @@ event Tick(float DeltaTime)
     
     if (MoveDist > TeleportDistThreshold)
     {
-        // Large distance - teleport
-        RemoteHero.SetLocation(Desired.Location);
-        PredictedLocation = Desired.Location;
-        PredictedYaw = Desired.Yaw;
+        // Large distance - teleport with a smooth blend-in from current position
+        // Blend 50% toward target on first frame to avoid hard snap
+        InterpLoc = VInterpTo(RemoteHero.Location, Desired.Location, DeltaTime, InterpSpeed * 0.5);
+        RemoteHero.SetLocation(InterpLoc);
+        PredictedLocation = InterpLoc;
     }
-    else
+    else if (MoveDist > 1.0)
     {
-        // Smooth interpolation directly toward desired network position
+        // Normal movement - smooth interpolation with speed-scaled rate
+        // Faster when far, slower when close for natural deceleration feel
         InterpLoc = VInterpTo(RemoteHero.Location, Desired.Location, DeltaTime, InterpSpeed);
         RemoteHero.SetLocation(InterpLoc);
         PredictedLocation = InterpLoc;
     }
-    
-    // Adaptive rotation interpolation - fast flicks snap, slow turns smooth
-    // Skip if position locking already set the rotation (door/vault/climb)
-    // Also skip during ledge locomotion - ledge system/animation controls rotation
-    if (!bPositionLocked && CurrentLocomotionMode != 4 && CurrentLocomotionMode != 5)
+    else
     {
-        RotDiff = Abs(Desired.Yaw - PredictedYaw);
-        if (RotDiff > 32768)
-            RotDiff = 65536 - RotDiff;
-        
-        if (RotDiff > 10922)  // ~60 degrees
-        {
-            // Fast flick - snap immediately
-            RemoteHero.SetRotation(DesiredRot);
-            PredictedYaw = Desired.Yaw;
-        }
-        else
-        {
-            // Slow turn - interpolate smoothly
-            InterpRot = RInterpTo(RemoteHero.Rotation, DesiredRot, DeltaTime, RotInterpSpeed);
-            RemoteHero.SetRotation(InterpRot);
-            PredictedYaw = InterpRot.Yaw;
-        }
+        // Very close - snap to avoid micro-jitter
+        RemoteHero.SetLocation(Desired.Location);
+        PredictedLocation = Desired.Location;
     }
+    
+    // Always apply mesh rotation (body facing direction from host)
+    // Use smooth interpolation for natural-looking turns
+    RemoteHero.SetRotation(RInterpTo(RemoteHero.Rotation, DesiredMeshRotation, DeltaTime, 12.0));
     
     RemoteHero.Velocity = Desired.Velocity;
     RemoteHero.Acceleration = Desired.Velocity;
@@ -892,24 +1217,72 @@ event Tick(float DeltaTime)
     // Update locomotion mode
     if (Desired.LocomotionMode != CurrentLocomotionMode)
     {
+        `log("[LOCO_CHANGE] OLD:" @ CurrentLocomotionMode @ "NEW:" @ Desired.LocomotionMode @ "SM:" @ CurrentSpecialMove @ "bPlaying:" @ bPlayingSpecialAnim @ "Time:" @ WorldInfo.TimeSeconds);
         switch (Desired.LocomotionMode)
         {
             case 0:  RemoteHero.LocomotionMode = LM_Walk; break;
             case 1:  RemoteHero.LocomotionMode = LM_Fall; break;
             case 2:  RemoteHero.LocomotionMode = LM_SpecialMove; break;
             case 3:  RemoteHero.LocomotionMode = LM_Ladder; break;
-            case 4:  RemoteHero.LocomotionMode = LM_LedgeHang; break;
-            case 5:  RemoteHero.LocomotionMode = LM_LedgeWalk; break;
+            case 4:
+                RemoteHero.LocomotionMode = LM_LedgeHang;
+                `log("[LEDGE_HANG_ENTER] Entering LM_LedgeHang. SM:" @ CurrentSpecialMove @ "bPlayingSpecialAnim:" @ bPlayingSpecialAnim @ "CurrentAnim:" @ RemoteHero.ShadowProxyFullBodyAnimSlot.GetPlayedAnimation() @ "Time:" @ WorldInfo.TimeSeconds);
+                // Snap to network position - hero should be at ledge position now
+                RemoteHero.SetLocation(Desired.Location);
+                PredictedLocation = Desired.Location;
+                RemoteHero.Velocity = vect(0,0,0);
+                RemoteHero.Acceleration = vect(0,0,0);
+                // Start ledge idle immediately - ShadowProxy anim tree doesn't auto-play it
+                if (RemoteHero.ShadowProxyFullBodyAnimSlot != None && !bPlayingSpecialAnim)
+                {
+                    `log("[LEDGE_HANG_IDLE] Starting player_ledge_idle (bPlayingSpecialAnim=false, slot available)");
+                    RemoteHero.ShadowProxyFullBodyAnimSlot.PlayCustomAnim('player_ledge_idle', 1.0, 0.0, 0.0, true, false);
+                }
+                else
+                {
+                    `log("[LEDGE_HANG_SKIP] NOT starting idle. bPlayingSpecialAnim:" @ bPlayingSpecialAnim @ "Slot:" @ (RemoteHero.ShadowProxyFullBodyAnimSlot != None));
+                }
+                break;
+            case 5:
+                RemoteHero.LocomotionMode = LM_LedgeWalk;
+                // Start ledge walk idle immediately
+                if (RemoteHero.ShadowProxyFullBodyAnimSlot != None && !bPlayingSpecialAnim)
+                {
+                    RemoteHero.ShadowProxyFullBodyAnimSlot.PlayCustomAnim('player_ledge_walk_idle', 1.0, 0.1, 0.0, true, false);
+                    `log("[LEDGE_WALK] Starting ledge_walk_idle Time:" @ WorldInfo.TimeSeconds);
+                }
+                break;
             case 6:  RemoteHero.LocomotionMode = LM_Squeeze; break;
             case 7:  RemoteHero.LocomotionMode = LM_Door; break;
             case 8:  RemoteHero.LocomotionMode = LM_Locker; break;
-            case 9:  RemoteHero.LocomotionMode = LM_Cinematic; break;
+            case 9:
+                RemoteHero.LocomotionMode = LM_Cinematic;
+                `log("[CUTSCENE_ENTER] Entering LM_Cinematic. CutsceneID:" @ Desired.ExtraData @ "Time:" @ WorldInfo.TimeSeconds);
+                // Play the cutscene animation based on ExtraData (cutscene ID)
+                if (Desired.ExtraData != CurrentCutsceneAnim && Desired.ExtraData != 0)
+                {
+                    PlayCutsceneAnimation(Desired.ExtraData);
+                    CurrentCutsceneAnim = Desired.ExtraData;
+                }
+                // Snap position and rotation
+                RemoteHero.SetLocation(Desired.Location);
+                PredictedLocation = Desired.Location;
+                RemoteHero.Velocity = vect(0,0,0);
+                RemoteHero.Acceleration = vect(0,0,0);
+                break;
             case 10: RemoteHero.LocomotionMode = LM_Bed; break;
             case 11: RemoteHero.LocomotionMode = LM_LookBack; break;
             case 12: RemoteHero.LocomotionMode = LM_Struggle; break;
             case 13: RemoteHero.LocomotionMode = LM_Grabbed; break;
             case 14: RemoteHero.LocomotionMode = LM_Pushing; break;
             case 15: RemoteHero.LocomotionMode = LM_ContextualLean; break;
+        }
+        // Handle exiting cutscene mode
+        if (CurrentLocomotionMode == 9 && Desired.LocomotionMode != 9)
+        {
+            `log("[CUTSCENE_EXIT] Exiting LM_Cinematic Time:" @ WorldInfo.TimeSeconds);
+            bPlayingCutscene = false;
+            CurrentCutsceneAnim = 0;
         }
         CurrentLocomotionMode = Desired.LocomotionMode;
     }
@@ -954,30 +1327,60 @@ event Tick(float DeltaTime)
     // Drive idle/movement animations (from original UpdateDummyMovementAnim)
     UpdateDummyMovementAnim();
     
-    // Ledge walk move animations - play shimmy anims based on velocity direction
-    // During LM_LedgeHang/LM_LedgeWalk, the ledge system drives position; anim is visual only
-    // No idle - just freeze the anim when stationary, resume when moving
-    if ((CurrentLocomotionMode == 4 || CurrentLocomotionMode == 5) && !bPlayingSpecialAnim)
+    // Ledge move animations - play shimmy anims based on velocity direction
+    // LM_LedgeHang (4) uses player_ledge_* anims
+    // LM_LedgeWalk (5) uses player_ledge_walk_* anims
+    // Use Desired.Velocity (network) since we clear RemoteHero.Velocity for ledge modes
+    if (CurrentLocomotionMode == 4 && !bPlayingSpecialAnim)
     {
+        // Ledge Hang - use player_ledge_* anims
         if (RemoteHero.ShadowProxyFullBodyAnimSlot != None)
         {
-            if (VSize(RemoteHero.Velocity) > 50.0)
+            if (VSize(Desired.Velocity) != 0.0)
             {
-                // Determine shimmy direction from velocity relative to pawn facing
-                if (RemoteHero.Velocity.X * -Sin(RemoteHero.Rotation.Yaw * 3.1415927 / 32768.0)
-                    + RemoteHero.Velocity.Y * Cos(RemoteHero.Rotation.Yaw * 3.1415927 / 32768.0) > 0.0)
+                if (Desired.Velocity.X * -Sin(RemoteHero.Rotation.Yaw * 3.1415927 / 32768.0)
+                    + Desired.Velocity.Y * Cos(RemoteHero.Rotation.Yaw * 3.1415927 / 32768.0) > 0.0)
+                {
+                    if (LastMovementAnim != 'player_ledge_move_right')
+                    {
+                        LastMovementAnim = 'player_ledge_move_right';
+                        RemoteHero.ShadowProxyFullBodyAnimSlot.PlayCustomAnim('player_ledge_move_right', 1.0, 0.1, 0.0, true, false);
+                    }
+                    else if (RemoteHero.ShadowProxyFullBodyAnimSlot.GetCustomAnimNodeSeq() != None)
+                        RemoteHero.ShadowProxyFullBodyAnimSlot.GetCustomAnimNodeSeq().Rate = 1.0;
+                }
+                else
+                {
+                    if (LastMovementAnim != 'player_ledge_move_left')
+                    {
+                        LastMovementAnim = 'player_ledge_move_left';
+                        RemoteHero.ShadowProxyFullBodyAnimSlot.PlayCustomAnim('player_ledge_move_left', 1.0, 0.1, 0.0, true, false);
+                    }
+                    else if (RemoteHero.ShadowProxyFullBodyAnimSlot.GetCustomAnimNodeSeq() != None)
+                        RemoteHero.ShadowProxyFullBodyAnimSlot.GetCustomAnimNodeSeq().Rate = 1.0;
+                }
+            }
+            else if (RemoteHero.ShadowProxyFullBodyAnimSlot.GetCustomAnimNodeSeq() != None)
+                RemoteHero.ShadowProxyFullBodyAnimSlot.GetCustomAnimNodeSeq().Rate = 0.0;
+        }
+    }
+    else if (CurrentLocomotionMode == 5 && !bPlayingSpecialAnim)
+    {
+        // Ledge Walk - use player_ledge_walk_* anims
+        if (RemoteHero.ShadowProxyFullBodyAnimSlot != None)
+        {
+            if (VSize(Desired.Velocity) != 0.0)
+            {
+                if (Desired.Velocity.X * -Sin(RemoteHero.Rotation.Yaw * 3.1415927 / 32768.0)
+                    + Desired.Velocity.Y * Cos(RemoteHero.Rotation.Yaw * 3.1415927 / 32768.0) > 0.0)
                 {
                     if (LastMovementAnim != 'player_ledge_walk_move_right')
                     {
                         LastMovementAnim = 'player_ledge_walk_move_right';
                         RemoteHero.ShadowProxyFullBodyAnimSlot.PlayCustomAnim('player_ledge_walk_move_right', 1.0, 0.1, 0.0, true, false);
                     }
-                    else
-                    {
-                        // Resume playback rate
-                        if (RemoteHero.ShadowProxyFullBodyAnimSlot.GetCustomAnimNodeSeq() != None)
-                            RemoteHero.ShadowProxyFullBodyAnimSlot.GetCustomAnimNodeSeq().Rate = 1.0;
-                    }
+                    else if (RemoteHero.ShadowProxyFullBodyAnimSlot.GetCustomAnimNodeSeq() != None)
+                        RemoteHero.ShadowProxyFullBodyAnimSlot.GetCustomAnimNodeSeq().Rate = 1.0;
                 }
                 else
                 {
@@ -986,20 +1389,12 @@ event Tick(float DeltaTime)
                         LastMovementAnim = 'player_ledge_walk_move_left';
                         RemoteHero.ShadowProxyFullBodyAnimSlot.PlayCustomAnim('player_ledge_walk_move_left', 1.0, 0.1, 0.0, true, false);
                     }
-                    else
-                    {
-                        // Resume playback rate
-                        if (RemoteHero.ShadowProxyFullBodyAnimSlot.GetCustomAnimNodeSeq() != None)
-                            RemoteHero.ShadowProxyFullBodyAnimSlot.GetCustomAnimNodeSeq().Rate = 1.0;
-                    }
+                    else if (RemoteHero.ShadowProxyFullBodyAnimSlot.GetCustomAnimNodeSeq() != None)
+                        RemoteHero.ShadowProxyFullBodyAnimSlot.GetCustomAnimNodeSeq().Rate = 1.0;
                 }
             }
-            else
-            {
-                // Frozen - pause the animation in place
-                if (RemoteHero.ShadowProxyFullBodyAnimSlot.GetCustomAnimNodeSeq() != None)
-                    RemoteHero.ShadowProxyFullBodyAnimSlot.GetCustomAnimNodeSeq().Rate = 0.0;
-            }
+            else if (RemoteHero.ShadowProxyFullBodyAnimSlot.GetCustomAnimNodeSeq() != None)
+                RemoteHero.ShadowProxyFullBodyAnimSlot.GetCustomAnimNodeSeq().Rate = 0.0;
         }
     }
     
@@ -1030,6 +1425,10 @@ event Tick(float DeltaTime)
     CurrentExtraData = Desired.ExtraData;
     CurrentExtraKind = Desired.ExtraKind;
     CurrentHealth = Desired.Health;
+    
+    // ExtraData contains bLeftAnim when not in cinematic mode
+    if (CurrentLocomotionMode != 9)
+        bCurrentLeftAnim = (Desired.ExtraData != 0);
     
     // Debug: log current state every frame
     if (bPlayingSpecialAnim || CurrentLocomotionMode == 4 || CurrentLocomotionMode == 5)
@@ -1302,7 +1701,6 @@ DefaultProperties
     bAlwaysTick=true
     TeleportDistThreshold=300.0
     InterpSpeed=25.0
-    RotInterpSpeed=100.0
     bHasState=false
     bPlayingSpecialAnim=false
     bPositionLocked=false

@@ -251,6 +251,7 @@ function CompactState DecodeStateDelta(string Packet, CompactState Baseline)
 }
 
 // Adaptive jitter buffer - dynamically adjusts delay based on network conditions
+// Improved with better smoothing and burst detection
 function UpdateJitterMetrics(float PacketTime)
 {
     local float Jitter, TimeDelta;
@@ -259,12 +260,23 @@ function UpdateJitterMetrics(float PacketTime)
     {
         TimeDelta = PacketTime - Metrics.LastPacketTime;
         
-        // Expected time between packets (33ms)
+        // Expected time between packets at 30Hz = 0.033s
         Jitter = Abs(TimeDelta - 0.033);
         
-        // Exponential moving average for jitter
+        // Detect packet bursts (multiple packets in < 10ms)
+        // If burst, use smaller jitter weight to not over-correct
+        if (TimeDelta < 0.01)
+            Jitter = Jitter * 0.3;
+        
+        // Exponential moving average for jitter with asymmetric weighting
+        // React faster to jitter increases, slower to decreases for stability
         if (Metrics.TotalPacketsReceived > 0)
-            Metrics.AverageJitter = (Metrics.AverageJitter * (1.0 - JitterWeight)) + (Jitter * JitterWeight);
+        {
+            if (Jitter > Metrics.AverageJitter)
+                Metrics.AverageJitter = Metrics.AverageJitter + (Jitter - Metrics.AverageJitter) * 0.3;  // Fast reaction to worse
+            else
+                Metrics.AverageJitter = Metrics.AverageJitter + (Jitter - Metrics.AverageJitter) * 0.05;  // Slow recovery to better
+        }
         else
             Metrics.AverageJitter = Jitter;
     }
@@ -272,12 +284,14 @@ function UpdateJitterMetrics(float PacketTime)
     Metrics.LastPacketTime = PacketTime;
     Metrics.TotalPacketsReceived++;
     
-    // Adaptive delay: base + (jitter * safety factor)
-    AdaptiveDelay = FClamp(MinDelay + (Metrics.AverageJitter * 2.0), MinDelay, MaxDelay);
+    // Adaptive delay: base + (jitter * safety factor with cap)
+    // Clamp jitter factor to prevent runaway delay
+    AdaptiveDelay = FClamp(MinDelay + FMin(Metrics.AverageJitter * 3.0, 0.05), MinDelay, MaxDelay);
 }
 
 // Hermite interpolation for smoother movement (considers velocity for curve)
-function vector HermiteInterp(vector P0, vector V0, vector P1, vector V1, float Alpha)
+// Now uses actual timestep between states instead of hardcoded 0.033
+function vector HermiteInterp(vector P0, vector V0, vector P1, vector V1, float Alpha, float DeltaTime)
 {
     local float Alpha2, Alpha3;
     local vector Result;
@@ -285,21 +299,20 @@ function vector HermiteInterp(vector P0, vector V0, vector P1, vector V1, float 
     Alpha2 = Alpha * Alpha;
     Alpha3 = Alpha2 * Alpha;
     
-    // Hermite basis functions
+    // Hermite basis functions - scale velocity by actual timestep for correct curve magnitude
     Result = P0 * (2.0 * Alpha3 - 3.0 * Alpha2 + 1.0)
-           + V0 * (Alpha3 - 2.0 * Alpha2 + Alpha) * 0.033  // Scale by timestep
+           + V0 * (Alpha3 - 2.0 * Alpha2 + Alpha) * DeltaTime
            + P1 * (-2.0 * Alpha3 + 3.0 * Alpha2)
-           + V1 * (Alpha3 - Alpha2) * 0.033;
+           + V1 * (Alpha3 - Alpha2) * DeltaTime;
     
     return Result;
 }
 
-// Predictive dead reckoning with acceleration
+// Predictive dead reckoning with acceleration and smooth deceleration
 function CompactState PredictState(CompactState LastState, float DeltaTime)
 {
     local CompactState Predicted;
-    local vector AccelDir;
-    local float Speed;
+    local float Speed, DampingFactor;
     
     Predicted = LastState;
     
@@ -308,18 +321,29 @@ function CompactState PredictState(CompactState LastState, float DeltaTime)
     Predicted.Location.Y += LastState.Velocity.Y * DeltaTime;
     // Don't extrapolate Z - causes floating/sinking
     
-    // Predict velocity damping (characters slow down when not moving)
-    Speed = VSize(LastState.Velocity);
-    if (Speed > 50.0)
+    // Smooth velocity damping model:
+    // Characters naturally decelerate when not actively moving
+    // Use exponential decay for realistic slowdown
+    Speed = Sqrt(LastState.Velocity.X * LastState.Velocity.X + LastState.Velocity.Y * LastState.Velocity.Y);
+    if (Speed > 10.0)
     {
-        // Apply slight damping for more accurate prediction
-        Predicted.Velocity = LastState.Velocity * (1.0 - DeltaTime * 0.5);
+        // Exponential decay: v(t) = v0 * e^(-k*t)
+        // k=2.0 gives ~86% reduction over 1 second
+        DampingFactor = Exp(-2.0 * DeltaTime);
+        Predicted.Velocity.X *= DampingFactor;
+        Predicted.Velocity.Y *= DampingFactor;
+    }
+    else
+    {
+        // Nearly stopped - zero out to avoid micro-drift
+        Predicted.Velocity.X = 0;
+        Predicted.Velocity.Y = 0;
     }
     
     return Predicted;
 }
 
-// Cubic interpolation for rotation (prevents gimbal lock issues)
+// Smooth cubic interpolation for rotation (prevents gimbal lock and jitter)
 function int CubicRotationInterp(int R0, int R1, float Alpha)
 {
     local int Delta;
@@ -333,20 +357,18 @@ function int CubicRotationInterp(int R0, int R1, float Alpha)
     else if (Delta < -32768)
         Delta += 65536;
     
-    // Cubic ease-in-out for smoother rotation
-    if (Alpha < 0.5)
-        SmoothAlpha = 2.0 * Alpha * Alpha;
-    else
-        SmoothAlpha = 1.0 - 2.0 * (1.0 - Alpha) * (1.0 - Alpha);
+    // Smooth-step interpolation: 3α² - 2α³ (smoother than linear)
+    // This gives natural acceleration/deceleration to rotation changes
+    SmoothAlpha = Alpha * Alpha * (3.0 - 2.0 * Alpha);
     
     return (R0 + int(float(Delta) * SmoothAlpha)) & 65535;
 }
 
 DefaultProperties
 {
-    MinDelay=0.01           // 10ms minimum delay
+    MinDelay=0.02           // 20ms minimum delay (was 10ms - gives more buffer room)
     MaxDelay=0.1            // 100ms maximum delay
-    AdaptiveDelay=0.03      // Start at 30ms
+    AdaptiveDelay=0.033     // Start at one packet interval
     JitterWeight=0.1        // Slow adaptation to jitter changes
     bHasReceivedState=false
 }

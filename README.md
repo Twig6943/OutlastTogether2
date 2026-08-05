@@ -11,7 +11,7 @@ Features:
 - Chat Box
 - Proximity Voice Chat (Very WIP)
 - Better GUI
-- Better Room Creaton/Joining
+- Better Room Creation/Joining
 - Stability.
 - ... More
 

@@ -60,6 +60,10 @@ var float LastDoorSyncTime;
 var int LastDoorSyncId;
 var float LastDoorOpenRatio;
 
+// Door break state tracking
+var array<int> LastDoorBreakStates;  // Pairs: [DoorId, BreakState, ...]
+var float LastDoorBreakScanTime;
+
 const NUM_PLAYER_MODELS = 11;
 
 var array<RemotePlayerData> RemotePlayers;
@@ -474,6 +478,65 @@ function float GetDoorSyncOpenRatio(OLHero H)
     return -1.0;
 }
 
+// Get door break state for the synced door (0=Normal, 1=Breaking, 2=Broken)
+function int GetDoorBreakState(OLHero H)
+{
+    if (H != None && H.ActiveDoor != None)
+        return int(H.ActiveDoor.DoorBreakState);
+    
+    // After release, keep sending the break state for up to 2s
+    if (LastActiveDoor != None && WorldInfo.TimeSeconds - LastDoorSyncTime < 2.0)
+        return int(LastActiveDoor.DoorBreakState);
+    
+    return 0;
+}
+
+function ScanDoorBreakStates()
+{
+    local OLDoor Door;
+    local int DoorId, Idx;
+    local bool bFound;
+    
+    if (WorldInfo.TimeSeconds - LastDoorBreakScanTime < 0.1)
+        return;
+    LastDoorBreakScanTime = WorldInfo.TimeSeconds;
+    
+    foreach DynamicActors(class'OLDoor', Door)
+    {
+        if (Door.DoorBreakState == 0)
+            continue;
+        
+        DoorId = int(Door.Location.X * 7 + Door.Location.Y * 13);
+        
+        // Find if we already tracked this door
+        bFound = false;
+        for (Idx = 0; Idx < LastDoorBreakStates.Length; Idx += 2)
+        {
+            if (LastDoorBreakStates[Idx] == DoorId)
+            {
+                // Only send if state changed
+                if (LastDoorBreakStates[Idx + 1] != int(Door.DoorBreakState))
+                {
+                    LastDoorBreakStates[Idx + 1] = int(Door.DoorBreakState);
+                    if (ConnectionLink != None && ConnectionLink.bIsConnected)
+                        ConnectionLink.SendText("DOOR_BREAK," $ DoorId $ "," $ int(Door.DoorBreakState) $ "\n");
+                }
+                bFound = true;
+                break;
+            }
+        }
+        
+        // New door with break state
+        if (!bFound)
+        {
+            LastDoorBreakStates.AddItem(DoorId);
+            LastDoorBreakStates.AddItem(int(Door.DoorBreakState));
+            if (ConnectionLink != None && ConnectionLink.bIsConnected)
+                ConnectionLink.SendText("DOOR_BREAK," $ DoorId $ "," $ int(Door.DoorBreakState) $ "\n");
+        }
+    }
+}
+
 // Map currently playing cutscene animation to an ID for network transmission
 function int GetCutsceneAnimId(OLHero H)
 {
@@ -484,6 +547,8 @@ function int GetCutsceneAnimId(OLHero H)
     
     // Get the currently playing animation on the full body slot
     AnimName = H.FullBodyAnimSlot.GetPlayedAnimation();
+    
+    `log("[CUTSCENE_DETECT] AnimName:" @ AnimName @ "LM:" @ H.LocomotionMode @ "Time:" @ WorldInfo.TimeSeconds);
     
     switch (AnimName)
     {
@@ -672,6 +737,9 @@ event PlayerTick(float DeltaTime)
 
             ConnectionLink.SendText(Packet $ "\n");
         }
+        
+        // Scan for door break state changes (bash/break)
+        ScanDoorBreakStates();
 
         if (VoiceListener != None && VoiceListener.bClientConnected && Pawn != None && WorldInfo.TimeSeconds - LastVoiceControlSendTime > 0.05)
         {
@@ -1080,6 +1148,19 @@ function OnReceiveData(string Data)
 
     if (Left(Data, 6) == "NOTIF,") { AddNotification(Right(Data, Len(Data) - 6)); return; }
     if (Left(Data, 5) == "SRUN,") { HandleSpeedrunPacket(Data); return; }
+    
+    // Handle door bash/break events from host
+    if (Left(Data, 11) == "DOOR_BREAK,")
+    {
+        F = SplitString(Data, ",", true);
+        if (F.Length >= 3 && RIdx >= 0 && RemotePlayers[RIdx].RemoteCtrl != None)
+        {
+            RemoteV2 = OLTogetherRemoteControllerV2(RemotePlayers[RIdx].RemoteCtrl);
+            if (RemoteV2 != None)
+                RemoteV2.HandleDoorBreakEvent(int(F[1]), int(F[2]));
+        }
+        return;
+    }
     
     // Handle player leaving - destroy their pawn and controller
     if (Left(Data, 5) == "LEFT,")

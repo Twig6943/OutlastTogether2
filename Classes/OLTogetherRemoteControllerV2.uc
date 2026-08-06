@@ -64,6 +64,7 @@ var float LastSpecialMoveEndTime;
 // Door sync state
 var int SyncDoorId;           // Hash of host's active door location
 var float SyncDoorOpenRatio;  // Host's active door open ratio (-1 = no door)
+var int SyncDoorBreakState;   // Host's door break state (0=Normal, 1=Breaking, 2=Broken)
 var OLDoor SyncedDoor;        // Cached reference to the synced door
 var float SyncedDoorOpenRatio; // Current interpolated open ratio
 
@@ -338,6 +339,8 @@ function PlaySpecialMoveAnim(int MoveType, bool bRunning)
     
     if (RemoteHero == None) return;
     if (RemoteHero.ShadowProxyFullBodyAnimSlot == None) return;
+    
+    `log("[PLAY_SM] MoveType:" @ MoveType @ "bPlayingBefore:" @ bPlayingSpecialAnim @ "CurrentSM:" @ CurrentSpecialMove @ "LM:" @ CurrentLocomotionMode @ "bCrouched:" @ bCurrentCrouched @ "bLeftAnim:" @ bCurrentLeftAnim @ "SlotAnim:" @ RemoteHero.ShadowProxyFullBodyAnimSlot.GetPlayedAnimation() @ "Time:" @ WorldInfo.TimeSeconds);
     
     if (bPlayingSpecialAnim)
         EndSpecialMoveAnim();
@@ -1029,9 +1032,19 @@ event Tick(float DeltaTime)
             bHostEndedSpecialMove = (Desired.SpecialMove == 0 && CurrentSpecialMove != 0)
                 || (ElapsedAnimTime > SpecialAnimDuration - 0.1);
         }
-        // SM 40 (EnterBed) - fall through to locomotion update same as ledge
+        // SM 40 (EnterBed) - same pattern as ledge: bridge idle early, then fallthrough
         else if (CurrentSpecialMove == 40)
         {
+            `log("[BED_TICK] SM:40 Elapsed:" @ ElapsedAnimTime @ "Duration:" @ SpecialAnimDuration @ "bBedIdleStarted:" @ bBedIdleStarted @ "Time:" @ WorldInfo.TimeSeconds);
+            
+            // Start bed idle early to bridge gap, like ledge does at 0.75s
+            if (!bBedIdleStarted && ElapsedAnimTime > SpecialAnimDuration - 0.3 && RemoteHero.ShadowProxyFullBodyAnimSlot != None)
+            {
+                `log("[BED_BRIDGE] Starting player_bed_idle early at" @ ElapsedAnimTime @ "Time:" @ WorldInfo.TimeSeconds);
+                RemoteHero.ShadowProxyFullBodyAnimSlot.PlayCustomAnim('player_bed_idle', 1.0, 0.25, 0.0, true, false);
+                bBedIdleStarted = true;
+            }
+            
             bHostEndedSpecialMove = (Desired.SpecialMove == 0 && CurrentSpecialMove != 0)
                 || (ElapsedAnimTime > SpecialAnimDuration - 0.1);
         }
@@ -1051,8 +1064,8 @@ event Tick(float DeltaTime)
         
         if (bHostEndedSpecialMove)
         {
-            `log("[SM_END] SM:" @ CurrentSpecialMove @ "LM_desired:" @ Desired.LocomotionMode @ "LM_current:" @ CurrentLocomotionMode @ "Elapsed:" @ (WorldInfo.TimeSeconds - SpecialAnimStartTime) @ "Time:" @ WorldInfo.TimeSeconds);
-            // For ledge grab and bed enter SMs: reset state but DON'T return early
+            `log("[SM_END] SM:" @ CurrentSpecialMove @ "LM_desired:" @ Desired.LocomotionMode @ "LM_current:" @ CurrentLocomotionMode @ "Elapsed:" @ (WorldInfo.TimeSeconds - SpecialAnimStartTime) @ "bPlaying:" @ bPlayingSpecialAnim @ "Time:" @ WorldInfo.TimeSeconds);
+            // For ledge grab and bed SMs: reset state but DON'T return early
             // Let the locomotion mode update happen in the same frame to avoid 1-frame gap
             if (CurrentSpecialMove == 14 || CurrentSpecialMove == 15)
             {
@@ -1068,11 +1081,10 @@ event Tick(float DeltaTime)
                 InstantVaultDelayTime = 0.0;
                 // Don't return - fall through to locomotion mode update below
             }
-            // Bed enter: same fall-through but DON'T reset CurrentSpecialMove
-            // so next frame doesn't re-trigger as a "new" SM 40
-            else if (CurrentSpecialMove == 40)
+            // Bed enter/exit: same fall-through
+            else if (CurrentSpecialMove == 40 || CurrentSpecialMove == 41)
             {
-                `log("[SM_BED_FALLTHROUGH] SM:40 Time:" @ WorldInfo.TimeSeconds);
+                `log("[SM_BED_FALLTHROUGH] SM:" @ CurrentSpecialMove @ "Time:" @ WorldInfo.TimeSeconds);
                 bPlayingSpecialAnim = false;
                 bPositionLocked = false;
                 bLockRotation = true;
@@ -1080,7 +1092,7 @@ event Tick(float DeltaTime)
                 PendingVaultMoveType = 0;
                 bPendingVaultRunning = false;
                 InstantVaultDelayTime = 0.0;
-                // Keep CurrentSpecialMove = 40 so next frame sees it as same SM, not new
+                // Keep CurrentSpecialMove so next frame doesn't re-trigger
                 // Don't return - fall through to locomotion mode update below
             }
             else
@@ -1129,6 +1141,7 @@ event Tick(float DeltaTime)
     }
     
     // Handle new special move start
+    `log("[SM_CHECK] SM_desired:" @ Desired.SpecialMove @ "SM_current:" @ CurrentSpecialMove @ "bPlaying:" @ bPlayingSpecialAnim @ "LM:" @ Desired.LocomotionMode @ "Time:" @ WorldInfo.TimeSeconds);
     if (!bPlayingSpecialAnim && Desired.SpecialMove != 0 && Desired.SpecialMove != CurrentSpecialMove)
     {
         `log("[SPECIAL_MOVE] SM=" @ Desired.SpecialMove @ "LM=" @ Desired.LocomotionMode @ "bPlaying=" @ bPlayingSpecialAnim @ "Time:" @ WorldInfo.TimeSeconds);
@@ -1270,7 +1283,19 @@ event Tick(float DeltaTime)
                 RemoteHero.Velocity = vect(0,0,0);
                 RemoteHero.Acceleration = vect(0,0,0);
                 break;
-            case 10: RemoteHero.LocomotionMode = LM_Bed; break;
+                case 10:
+                    // Don't set LM_Bed while SM 40 (enter bed) is still playing
+                    // The enter bed anim plays in LM_Walk, then transitions to LM_Bed after
+                    if (CurrentSpecialMove == 40)
+                    {
+                        `log("[LOCO_BED_SKIP] SM 40 still active, deferring LM_Bed Time:" @ WorldInfo.TimeSeconds);
+                    }
+                    else
+                    {
+                        RemoteHero.LocomotionMode = LM_Bed;
+                        `log("[LOCO_BED] Setting LM_Bed. SM_current:" @ CurrentSpecialMove @ "bPlaying:" @ bPlayingSpecialAnim @ "Time:" @ WorldInfo.TimeSeconds);
+                    }
+                    break;
             case 11: RemoteHero.LocomotionMode = LM_LookBack; break;
             case 12: RemoteHero.LocomotionMode = LM_Struggle; break;
             case 13: RemoteHero.LocomotionMode = LM_Grabbed; break;
@@ -1420,6 +1445,7 @@ event Tick(float DeltaTime)
     
     // Apply synced door state (actual door mesh movement)
     ApplyDoorSync();
+    ApplyDoorBreakState();
     
     CurrentDoorDir = Desired.DoorDir;
     CurrentExtraData = Desired.ExtraData;
@@ -1465,6 +1491,60 @@ function SyncDoorState(int DoorId, float DoorOpenRatio)
     if (SyncedDoor == None || !IsDoorMatchingId(SyncedDoor, DoorId))
     {
         SyncedDoor = FindDoorById(DoorId);
+    }
+}
+
+function SetDoorBreakState(int BreakState)
+{
+    if (SyncedDoor == None || SyncDoorBreakState == BreakState)
+        return;
+    
+    SyncDoorBreakState = BreakState;
+    ApplyDoorBreakState();
+}
+
+// Handle door bash/break event from host - find the door and call the native event
+function HandleDoorBreakEvent(int DoorId, int BreakState)
+{
+    local OLDoor Door;
+    
+    Door = FindDoorById(DoorId);
+    if (Door == None)
+    {
+        `log("[DOOR_BREAK] Door not found for ID:" @ DoorId @ "Time:" @ WorldInfo.TimeSeconds);
+        return;
+    }
+    
+    `log("[DOOR_BREAK] Received DoorId:" @ DoorId @ "State:" @ BreakState @ "Door:" @ Door @ "DoorBreakState:" @ Door.DoorBreakState @ "Time:" @ WorldInfo.TimeSeconds);
+    
+    if (BreakState == 1) // Bash - can happen multiple times
+    {
+        `log("[DOOR_BASH] Calling BashDoor on:" @ Door);
+        Door.BashDoor(false);
+    }
+    else if (BreakState == 2 && Door.DoorBreakState != 2) // Break - only if not already broken
+    {
+        `log("[DOOR_BREAK] Calling BreakDoor on:" @ Door);
+        Door.BreakDoor(None, false);
+    }
+}
+
+// Apply door break state by calling the door's native events
+// DBS_Normal=0, DBS_Breaking=1, DBS_Broken=2
+function ApplyDoorBreakState()
+{
+    if (SyncedDoor == None)
+        return;
+    
+    if (SyncDoorBreakState == 1 && SyncedDoor.DoorBreakState == 0) // DBS_Breaking, only if currently normal
+    {
+        `log("[DOOR_BASH] Calling BashDoor on:" @ SyncedDoor @ "Time:" @ WorldInfo.TimeSeconds);
+        SyncedDoor.BashDoor(false);
+    }
+    else if (SyncDoorBreakState == 2 && SyncedDoor.DoorBreakState != 2) // DBS_Broken, only if not already broken
+    {
+        `log("[DOOR_BREAK] Calling BreakDoor on:" @ SyncedDoor @ "Time:" @ WorldInfo.TimeSeconds);
+        SyncedDoor.BreakDoor(None, false);
     }
 }
 

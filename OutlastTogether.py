@@ -5,6 +5,7 @@ import json
 import logging
 import math
 import os
+import queue
 import random
 import signal
 import socket
@@ -303,6 +304,1307 @@ GAME_CONTROL_RETRY = 2.0
 
 def _now() -> float:
     return time.monotonic()
+
+
+# ===========================================================================
+# Steam integration (Wave 0: binding foundation)
+# ---------------------------------------------------------------------------
+# Everything Steam lives in this ONE file (no separate module), mirroring how
+# VoiceRelay / VoiceClient already coexist here. This section is a pure-ctypes
+# binding against the Steamworks *flat* C API (steam_api_flat.h) plus the
+# Manual Dispatch callback loop (steam_api.h). No third-party wrapper, no
+# DLLBind, no C++ shim.
+#
+# Wave 0 scope: load the DLL, SteamAPI_InitFlat with App ID 480 (Spacewar),
+# run a single dedicated Steam thread that pumps callbacks ~60 Hz via the
+# manual-dispatch API, and expose our own SteamID64 + persona name. Later
+# waves add networking-messages (transport), matchmaking (lobbies), friends
+# (invites) and a voice channel on top of this same pump.
+#
+# The whole thing is best-effort: if Steam isn't running or the DLL is
+# missing, Steam.init() returns False and the app falls back to TCP/LAN.
+# ===========================================================================
+
+STEAM_APP_ID = 480          # Spacewar — free P2P + lobbies for development
+STEAM_DISPATCH_HZ = 60      # callback pump rate on the Steam thread
+
+# Callback base ids (steam_api_internal.h) — used to identify CallbackMsg_t.
+_K_ISteamUserCallbacks = 100
+_K_ISteamFriendsCallbacks = 300
+_K_ISteamMatchmakingCallbacks = 500
+_K_ISteamUtilsCallbacks = 700
+_K_ISteamNetworkingMessagesCallbacks = 1250
+# SteamAPICallCompleted_t (a call *result* is ready). isteamutils.h: 700 + 3.
+_K_iSteamAPICallCompleted = _K_ISteamUtilsCallbacks + 3   # 703
+
+# ISteamNetworkingMessages callbacks (steam_api_internal.h: base 1250).
+_K_iSteamNetworkingMessagesSessionRequest = _K_ISteamNetworkingMessagesCallbacks + 1  # 1251
+_K_iSteamNetworkingMessagesSessionFailed = _K_ISteamNetworkingMessagesCallbacks + 2   # 1252
+
+# ESteamAPIInitResult (steam_api.h)
+_K_ESteamAPIInitResult_OK = 0
+
+# EResult (steamclientpublic.h) — note Steam uses 1 for OK, not 0.
+_K_EResultOK = 1
+
+# ESteamNetworkingIdentityType (steamnetworkingtypes.h)
+_K_ESteamNetworkingIdentityType_SteamID = 16
+
+# k_nSteamNetworkingSend_* flags (steamnetworkingtypes.h)
+_K_nSteamNetworkingSend_Unreliable = 0
+_K_nSteamNetworkingSend_NoNagle = 1
+_K_nSteamNetworkingSend_Reliable = 8
+_K_nSteamNetworkingSend_ReliableNoNagle = _K_nSteamNetworkingSend_Reliable | _K_nSteamNetworkingSend_NoNagle  # 9
+
+# Our P2P channel assignment. ch0 carries the reliable/ordered byte tunnel that
+# stands in for the game's TCP stream. A separate control channel carries small
+# session-management messages (HELLO/BYE) so they never pollute the byte stream.
+# (Wave 3 adds ch1 for unreliable voice.)
+STEAM_NET_CH_DATA = 0
+STEAM_NET_CH_CTRL = 100
+
+
+class _CallbackMsg_t(ctypes.Structure):
+    """Mirrors CallbackMsg_t (steam_api_internal.h), pack(8) on x64.
+
+        HSteamUser m_hSteamUser;  // int32
+        int        m_iCallback;   // int32
+        uint8     *m_pubParam;    // pointer to the callback struct
+        int        m_cubParam;    // int32 size of *m_pubParam
+    """
+    _pack_ = 8
+    _fields_ = [
+        ("m_hSteamUser", ctypes.c_int32),
+        ("m_iCallback", ctypes.c_int32),
+        ("m_pubParam", ctypes.c_void_p),
+        ("m_cubParam", ctypes.c_int32),
+    ]
+
+
+class _SteamNetworkingIdentity(ctypes.Structure):
+    """Mirrors SteamNetworkingIdentity (steamnetworkingtypes.h), pack(1).
+
+        ESteamNetworkingIdentityType m_eType;   // int32
+        int m_cbSize;                            // int32
+        union { uint64 m_steamID64; ... uint32 m_reserved[32]; };  // 128 bytes
+
+    We only ever use the SteamID form, but the union is padded to its full
+    128-byte size so the struct's total length (136 bytes) matches the C ABI
+    exactly — critical because this is embedded by value inside
+    SteamNetworkingMessage_t and passed by reference to the flat API.
+    """
+    _pack_ = 1
+    _fields_ = [
+        ("m_eType", ctypes.c_int32),
+        ("m_cbSize", ctypes.c_int32),
+        ("m_steamID64", ctypes.c_uint64),
+        ("_m_union_pad", ctypes.c_uint8 * (128 - 8)),
+    ]
+
+
+# void (*)(SteamNetworkingMessage_t *) — the per-message Release() thunk.
+_MSG_RELEASE_FN = ctypes.CFUNCTYPE(None, ctypes.c_void_p)
+
+
+class _SteamNetworkingMessage_t(ctypes.Structure):
+    """Mirrors SteamNetworkingMessage_t (steamnetworkingtypes.h), default pack(8).
+
+    Field offsets (x64) matter because ReceiveMessagesOnChannel hands back an
+    array of pointers to these and we read them in place:
+        m_pData        @0   payload pointer
+        m_cbSize       @8   payload length
+        m_conn         @12
+        m_identityPeer @16  (136-byte pack(1) identity; sender SteamID64 @24)
+        ...
+        m_pfnRelease   @184 call this (with the message pointer) to free it
+        m_nChannel     @192 channel the message arrived on
+    """
+    _pack_ = 8
+    _fields_ = [
+        ("m_pData", ctypes.c_void_p),                       # 0
+        ("m_cbSize", ctypes.c_int32),                       # 8
+        ("m_conn", ctypes.c_uint32),                        # 12
+        ("m_identityPeer", _SteamNetworkingIdentity),       # 16 (len 136)
+        ("m_nConnUserData", ctypes.c_int64),                # 152
+        ("m_usecTimeReceived", ctypes.c_int64),             # 160
+        ("m_nMessageNumber", ctypes.c_int64),               # 168
+        ("m_pfnFreeData", ctypes.c_void_p),                 # 176
+        ("m_pfnRelease", ctypes.c_void_p),                  # 184
+        ("m_nChannel", ctypes.c_int32),                     # 192
+        ("m_nFlags", ctypes.c_int32),                       # 196
+        ("m_nUserData", ctypes.c_int64),                    # 200
+        ("m_idxLane", ctypes.c_uint16),                     # 208
+        ("_pad1__", ctypes.c_uint16),                       # 210
+    ]
+
+
+def _steam_dll_candidates():
+    """Return likely on-disk locations of the Steamworks redistributable library.
+    Works across Windows/Linux/macOS, 64-bit and 32-bit."""
+    is64 = (ctypes.sizeof(ctypes.c_void_p) == 8)
+    platform = sys.platform
+
+    if platform == "win32":
+        name = "steam_api64.dll" if is64 else "steam_api.dll"
+        sdk_subdir = "win64" if is64 else ""
+    elif platform == "linux":
+        name = "libsteam_api.so"
+        sdk_subdir = "linux64" if is64 else "linux32"
+    elif platform == "darwin":
+        name = "libsteam_api.dylib"
+        sdk_subdir = "osx"
+    else:
+        name = "steam_api64.dll"
+        sdk_subdir = "win64"
+
+    cands = [
+        _resource_path(name),
+        _resource_path(os.path.join("steam", name)),
+        _resource_path(os.path.join(sdk_subdir, name)),
+    ]
+
+    sdk = _resource_path(os.path.join("steamworks_sdk_165", "sdk", "redistributable_bin"))
+    cands.append(os.path.join(sdk, sdk_subdir, name))
+
+    if platform == "linux":
+        home = os.path.expanduser("~")
+        cands += [
+            "/usr/lib/" + name,
+            "/usr/lib64/" + name,
+            "/usr/local/lib/" + name,
+            os.path.join(home, ".local", "share", "Steam", "steam", "linux64", name),
+            os.path.join(home, ".steam", "steam", "linux64", name),
+        ]
+    elif platform == "darwin":
+        home = os.path.expanduser("~")
+        cands += [
+            "/usr/local/lib/" + name,
+            "/Library/Application Support/Steam/Steam.AppBundle/Steam/Library/ForcePkgs/steam_macos/" + name,
+            os.path.join(home, "Library", "Application Support", "Steam", "steam", name),
+        ]
+
+    seen = set()
+    return [c for c in cands if not (c in seen or seen.add(c))]
+
+
+def _ensure_steam_appid_file(app_id: int = STEAM_APP_ID):
+    """Write steam_appid.txt (contents e.g. '480') so SteamAPI_Init succeeds in
+    development without owning a real appid. Steam reads this from the process
+    working directory, so write it there and next to the app; ignore failures."""
+    targets = []
+    try:
+        targets.append(os.path.join(os.getcwd(), "steam_appid.txt"))
+    except Exception:
+        pass
+    try:
+        base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+        targets.append(os.path.join(base, "steam_appid.txt"))
+    except Exception:
+        pass
+    for path in dict.fromkeys(targets):     # de-dupe, keep order
+        try:
+            if os.path.isfile(path):
+                with open(path, "r", encoding="ascii", errors="ignore") as fh:
+                    if fh.read().strip() == str(app_id):
+                        continue
+            with open(path, "w", encoding="ascii") as fh:
+                fh.write(str(app_id))
+        except Exception:
+            pass
+
+
+class Steam:
+    """Single-owner Steam client. All Steam API calls happen on the dedicated
+    Steam thread (the flat API is not safe to call concurrently). Other threads
+    talk to it through thread-safe queues / registered callback handlers.
+
+    Wave 0 exposes: init(), shutdown(), get_steam_id(), get_persona_name(),
+    register_callback(id, fn), register_call_result(api_call, fn), and the
+    pump loop that makes callbacks actually fire.
+    """
+
+    def __init__(self, app_id: int = STEAM_APP_ID):
+        self.app_id = app_id
+        self._dll = None
+        self._pipe = 0                      # HSteamPipe
+        self._running = False
+        self._thread = None
+        self._ready = threading.Event()     # set once init succeeds/fails on the thread
+        self._init_ok = False
+        self._init_error = ""
+        self._steam_id = 0
+        self._persona = ""
+        # Handlers run ON the Steam thread; keep them quick / hand off via queues.
+        self._cb_handlers: Dict[int, list] = {}          # iCallback -> [fn(bytes)]
+        self._call_results: Dict[int, list] = {}         # SteamAPICall_t -> [fn(bytes, failed)]
+        self._lock = threading.Lock()
+        self._dll_path = ""
+        # -- Wave 1: ISteamNetworkingMessages P2P transport state --------------
+        # All Steam API calls happen on the Steam thread, so cross-thread callers
+        # (loopback socket pumps) enqueue commands here and the pump drains them.
+        self._net = None                    # ISteamNetworkingMessages* (void_p), Steam thread only
+        self._net_symbols_ok = False        # flat networking symbols resolved?
+        self._net_cmds: "queue.Queue" = queue.Queue()
+        self._net_receivers: list = []      # [fn(peer_id:int, data:bytes, channel:int)] on Steam thread
+        self._session_request_handler = None  # fn(peer_id:int) -> bool, on Steam thread
+        self._net_recv_channels = (STEAM_NET_CH_DATA, STEAM_NET_CH_CTRL)
+
+    # -- lifecycle ---------------------------------------------------------
+
+    def init(self, timeout: float = 5.0) -> bool:
+        """Start the Steam thread and initialise the API. Returns True on success.
+        Safe to call when Steam is not running — returns False, logs why."""
+        if self._running:
+            return self._init_ok
+        self._running = True
+        self._thread = threading.Thread(target=self._run, name="SteamThread", daemon=True)
+        self._thread.start()
+        # Wait for the thread to finish attempting init so callers get a straight bool.
+        self._ready.wait(timeout)
+        if not self._init_ok and self._init_error:
+            LOG.warning("Steam init failed: %s", self._init_error)
+        return self._init_ok
+
+    def shutdown(self):
+        self._running = False
+        t = self._thread
+        if t is not None and t.is_alive() and t is not threading.current_thread():
+            t.join(timeout=3.0)
+        self._thread = None
+
+    @property
+    def available(self) -> bool:
+        return self._init_ok
+
+    # -- public accessors (thread-safe reads of cached values) -------------
+
+    def get_steam_id(self) -> int:
+        with self._lock:
+            return self._steam_id
+
+    def get_persona_name(self) -> str:
+        with self._lock:
+            return self._persona
+
+    # -- handler registration (callable from any thread) -------------------
+
+    def register_callback(self, callback_id: int, fn):
+        """Register fn(raw_bytes) for a broadcast callback identified by its
+        k_iCallback id. Fires on the Steam thread."""
+        with self._lock:
+            self._cb_handlers.setdefault(int(callback_id), []).append(fn)
+
+    def register_call_result(self, api_call: int, fn):
+        """Register fn(raw_bytes, failed:bool) for a one-shot SteamAPICall_t
+        result (e.g. the async result of CreateLobby)."""
+        if not api_call:
+            return
+        with self._lock:
+            self._call_results.setdefault(int(api_call), []).append(fn)
+
+    # -- DLL binding (runs on the Steam thread) ----------------------------
+
+    def _load_dll(self) -> bool:
+        cands = _steam_dll_candidates()
+        LOG.debug("Steam library search paths: %s", cands)
+        for path in cands:
+            if not os.path.isfile(path):
+                LOG.debug("  skip (not found): %s", path)
+                continue
+            LOG.debug("  trying: %s", path)
+            try:
+                self._dll = ctypes.CDLL(path)
+                self._dll_path = path
+                self._declare_signatures()
+                LOG.info("Steam library loaded: %s", path)
+                return True
+            except Exception as exc:
+                self._init_error = f"failed loading {path}: {exc}"
+                LOG.debug("  failed: %s", exc)
+        if not self._init_error:
+            self._init_error = "steam_api library not found"
+        return False
+
+    def _declare_signatures(self):
+        """Pin restype/argtypes for every flat-API function we call. Getting
+        these right is what keeps the manual-dispatch marshalling stable."""
+        d = self._dll
+        # Init / shutdown / relaunch guard.
+        d.SteamAPI_InitFlat.restype = ctypes.c_int          # ESteamAPIInitResult
+        d.SteamAPI_InitFlat.argtypes = [ctypes.c_char_p]    # SteamErrMsg* (char[1024])
+        d.SteamAPI_Shutdown.restype = None
+        d.SteamAPI_Shutdown.argtypes = []
+        d.SteamAPI_RestartAppIfNecessary.restype = ctypes.c_bool
+        d.SteamAPI_RestartAppIfNecessary.argtypes = [ctypes.c_uint32]
+        d.SteamAPI_GetHSteamPipe.restype = ctypes.c_int32   # HSteamPipe
+        d.SteamAPI_GetHSteamPipe.argtypes = []
+        # Manual dispatch.
+        d.SteamAPI_ManualDispatch_Init.restype = None
+        d.SteamAPI_ManualDispatch_Init.argtypes = []
+        d.SteamAPI_ManualDispatch_RunFrame.restype = None
+        d.SteamAPI_ManualDispatch_RunFrame.argtypes = [ctypes.c_int32]
+        d.SteamAPI_ManualDispatch_GetNextCallback.restype = ctypes.c_bool
+        d.SteamAPI_ManualDispatch_GetNextCallback.argtypes = [
+            ctypes.c_int32, ctypes.POINTER(_CallbackMsg_t)]
+        d.SteamAPI_ManualDispatch_FreeLastCallback.restype = None
+        d.SteamAPI_ManualDispatch_FreeLastCallback.argtypes = [ctypes.c_int32]
+        d.SteamAPI_ManualDispatch_GetAPICallResult.restype = ctypes.c_bool
+        d.SteamAPI_ManualDispatch_GetAPICallResult.argtypes = [
+            ctypes.c_int32, ctypes.c_uint64, ctypes.c_void_p,
+            ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_bool)]
+        # User / Friends accessors (flat API returns interface pointers).
+        d.SteamAPI_SteamUser_v023.restype = ctypes.c_void_p
+        d.SteamAPI_SteamUser_v023.argtypes = []
+        d.SteamAPI_ISteamUser_GetSteamID.restype = ctypes.c_uint64
+        d.SteamAPI_ISteamUser_GetSteamID.argtypes = [ctypes.c_void_p]
+        d.SteamAPI_SteamFriends_v018.restype = ctypes.c_void_p
+        d.SteamAPI_SteamFriends_v018.argtypes = []
+        d.SteamAPI_ISteamFriends_GetPersonaName.restype = ctypes.c_char_p
+        d.SteamAPI_ISteamFriends_GetPersonaName.argtypes = [ctypes.c_void_p]
+        self._declare_net_signatures(d)
+
+    def _declare_net_signatures(self, d):
+        """Pin signatures for ISteamNetworkingMessages (Wave 1 P2P tunnel).
+
+        Kept separate and best-effort: if a symbol is missing (older redist),
+        networking simply stays disabled and Wave 0 + the TCP fallback are
+        unaffected."""
+        try:
+            ident = ctypes.POINTER(_SteamNetworkingIdentity)
+            d.SteamAPI_SteamNetworkingMessages_SteamAPI_v002.restype = ctypes.c_void_p
+            d.SteamAPI_SteamNetworkingMessages_SteamAPI_v002.argtypes = []
+            # EResult SendMessageToUser(self, const identity&, const void*, uint32, int, int)
+            d.SteamAPI_ISteamNetworkingMessages_SendMessageToUser.restype = ctypes.c_int
+            d.SteamAPI_ISteamNetworkingMessages_SendMessageToUser.argtypes = [
+                ctypes.c_void_p, ident, ctypes.c_void_p,
+                ctypes.c_uint32, ctypes.c_int, ctypes.c_int]
+            # int ReceiveMessagesOnChannel(self, int, SteamNetworkingMessage_t**, int)
+            d.SteamAPI_ISteamNetworkingMessages_ReceiveMessagesOnChannel.restype = ctypes.c_int
+            d.SteamAPI_ISteamNetworkingMessages_ReceiveMessagesOnChannel.argtypes = [
+                ctypes.c_void_p, ctypes.c_int, ctypes.POINTER(ctypes.c_void_p), ctypes.c_int]
+            # bool AcceptSessionWithUser(self, const identity&)
+            d.SteamAPI_ISteamNetworkingMessages_AcceptSessionWithUser.restype = ctypes.c_bool
+            d.SteamAPI_ISteamNetworkingMessages_AcceptSessionWithUser.argtypes = [ctypes.c_void_p, ident]
+            # bool CloseSessionWithUser(self, const identity&)
+            d.SteamAPI_ISteamNetworkingMessages_CloseSessionWithUser.restype = ctypes.c_bool
+            d.SteamAPI_ISteamNetworkingMessages_CloseSessionWithUser.argtypes = [ctypes.c_void_p, ident]
+            # bool CloseChannelWithUser(self, const identity&, int)
+            d.SteamAPI_ISteamNetworkingMessages_CloseChannelWithUser.restype = ctypes.c_bool
+            d.SteamAPI_ISteamNetworkingMessages_CloseChannelWithUser.argtypes = [
+                ctypes.c_void_p, ident, ctypes.c_int]
+            self._net_symbols_ok = True
+        except AttributeError as exc:
+            self._net_symbols_ok = False
+            LOG.warning("Steam networking symbols unavailable (%s); P2P disabled.", exc)
+
+    def _refresh_identity(self):
+        try:
+            user = self._dll.SteamAPI_SteamUser_v023()
+            sid = int(self._dll.SteamAPI_ISteamUser_GetSteamID(user)) if user else 0
+            friends = self._dll.SteamAPI_SteamFriends_v018()
+            raw = self._dll.SteamAPI_ISteamFriends_GetPersonaName(friends) if friends else b""
+            name = raw.decode("utf-8", "replace") if raw else ""
+        except Exception as exc:
+            LOG.debug("Steam identity refresh failed: %s", exc)
+            return
+        with self._lock:
+            self._steam_id = sid
+            self._persona = name
+
+    # -- Steam thread: init + callback pump --------------------------------
+
+    def _run(self):
+        try:
+            if not self._load_dll():
+                return
+            # Make Spacewar (App ID 480) init succeed in dev: the env var is the
+            # most reliable signal (works frozen, no CWD assumptions); the file
+            # is written too for tools that only read it.
+            os.environ.setdefault("SteamAppId", str(self.app_id))
+            os.environ.setdefault("SteamGameId", str(self.app_id))
+            _ensure_steam_appid_file(self.app_id)
+            # steam_appid.txt next to the DLL/app lets Spacewar init in dev.
+            if self._dll.SteamAPI_RestartAppIfNecessary(ctypes.c_uint32(self.app_id)):
+                self._init_error = "SteamAPI_RestartAppIfNecessary requested relaunch"
+                return
+            err = ctypes.create_string_buffer(1024)   # SteamErrMsg
+            res = self._dll.SteamAPI_InitFlat(err)
+            if res != _K_ESteamAPIInitResult_OK:
+                msg = err.value.decode("utf-8", "replace").strip()
+                self._init_error = f"SteamAPI_InitFlat -> {res} ({msg or 'no detail'})"
+                return
+            self._dll.SteamAPI_ManualDispatch_Init()
+            self._pipe = int(self._dll.SteamAPI_GetHSteamPipe())
+            if not self._pipe:
+                self._init_error = "SteamAPI_GetHSteamPipe returned 0"
+                self._dll.SteamAPI_Shutdown()
+                return
+            self._refresh_identity()
+            self._init_ok = True
+            LOG.info("Steam init OK — SteamID64=%s persona=%r dll=%s",
+                     self._steam_id, self._persona, self._dll_path)
+        finally:
+            # Unblock init() whether we succeeded or failed.
+            self._ready.set()
+
+        if not self._init_ok:
+            return
+
+        # Networking is best-effort and must never break Wave 0 / TCP fallback.
+        self._init_networking()
+
+        interval = 1.0 / float(STEAM_DISPATCH_HZ)
+        try:
+            while self._running:
+                self._pump_once()
+                self._net_drain_cmds()
+                self._net_receive()
+                time.sleep(interval)
+        finally:
+            self._net_teardown()
+            try:
+                self._dll.SteamAPI_Shutdown()
+            except Exception:
+                pass
+            self._init_ok = False
+            LOG.info("Steam shut down.")
+
+    def _pump_once(self):
+        """One manual-dispatch frame: drain every pending callback and route it.
+        Follows the reference loop in steam_api.h exactly."""
+        d = self._dll
+        d.SteamAPI_ManualDispatch_RunFrame(self._pipe)
+        msg = _CallbackMsg_t()
+        while d.SteamAPI_ManualDispatch_GetNextCallback(self._pipe, ctypes.byref(msg)):
+            try:
+                if msg.m_cubParam > 0 and msg.m_pubParam:
+                    raw = ctypes.string_at(msg.m_pubParam, msg.m_cubParam)
+                else:
+                    raw = b""
+                if msg.m_iCallback == _K_iSteamAPICallCompleted:
+                    self._dispatch_call_result(raw)
+                else:
+                    self._dispatch_callback(msg.m_iCallback, raw)
+            except Exception as exc:
+                LOG.exception("Steam callback %s handler error: %s",
+                              msg.m_iCallback, exc)
+            finally:
+                d.SteamAPI_ManualDispatch_FreeLastCallback(self._pipe)
+
+    def _dispatch_callback(self, callback_id: int, raw: bytes):
+        with self._lock:
+            handlers = list(self._cb_handlers.get(callback_id, ()))
+        for fn in handlers:
+            fn(raw)
+
+    def _dispatch_call_result(self, raw: bytes):
+        """raw is a SteamAPICallCompleted_t: { uint64 m_hAsyncCall; int
+        m_iCallback; uint32 m_cubParam }. Fetch the real result payload and
+        route it to whoever registered for that call handle."""
+        if len(raw) < 16:
+            return
+        h_async_call = struct.unpack_from("<Q", raw, 0)[0]
+        i_callback = struct.unpack_from("<i", raw, 8)[0]
+        cub = struct.unpack_from("<I", raw, 12)[0]
+        with self._lock:
+            handlers = self._call_results.pop(h_async_call, None)
+        if not handlers:
+            return
+        buf = ctypes.create_string_buffer(cub if cub else 1)
+        failed = ctypes.c_bool(False)
+        ok = self._dll.SteamAPI_ManualDispatch_GetAPICallResult(
+            self._pipe, ctypes.c_uint64(h_async_call), buf, cub,
+            i_callback, ctypes.byref(failed))
+        if not ok:
+            return
+        payload = buf.raw[:cub] if cub else b""
+        for fn in handlers:
+            fn(payload, bool(failed.value))
+
+    # -- Wave 1: P2P transport (ISteamNetworkingMessages) ------------------
+    # Public methods below are thread-safe: they only enqueue commands or touch
+    # lock-guarded lists. Everything prefixed `_net_*_raw` and the receive/drain
+    # helpers run exclusively on the Steam thread.
+
+    @property
+    def net_available(self) -> bool:
+        return bool(self._init_ok and self._net_symbols_ok and self._net)
+
+    def net_enable(self) -> bool:
+        """Best-effort readiness check for callers. The interface itself is
+        acquired automatically on the Steam thread once init succeeds."""
+        return self.net_available
+
+    def net_send(self, steam_id64: int, data: bytes,
+                 channel: int = STEAM_NET_CH_DATA, reliable: bool = True):
+        """Queue a P2P message to a peer. Fire-and-forget from any thread."""
+        if not steam_id64 or not data:
+            return
+        flags = (_K_nSteamNetworkingSend_ReliableNoNagle if reliable
+                 else _K_nSteamNetworkingSend_Unreliable | _K_nSteamNetworkingSend_NoNagle)
+        self._net_cmds.put(("send", int(steam_id64), bytes(data), int(channel), int(flags)))
+
+    def net_accept(self, steam_id64: int):
+        if steam_id64:
+            self._net_cmds.put(("accept", int(steam_id64), None, 0, 0))
+
+    def net_close(self, steam_id64: int):
+        if steam_id64:
+            self._net_cmds.put(("close", int(steam_id64), None, 0, 0))
+
+    def add_net_receiver(self, fn):
+        """Register fn(peer_id:int, data:bytes, channel:int). Fires on the Steam
+        thread; keep it quick (hand off via a queue)."""
+        with self._lock:
+            if fn not in self._net_receivers:
+                self._net_receivers.append(fn)
+
+    def remove_net_receiver(self, fn):
+        with self._lock:
+            try:
+                self._net_receivers.remove(fn)
+            except ValueError:
+                pass
+
+    def set_session_request_handler(self, fn):
+        """fn(peer_id:int) -> bool decides whether to accept an inbound session.
+        Runs on the Steam thread. None disables acceptance."""
+        with self._lock:
+            self._session_request_handler = fn
+
+    # -- Steam-thread-only networking internals ----------------------------
+
+    @staticmethod
+    def _make_identity(steam_id64: int) -> "_SteamNetworkingIdentity":
+        ident = _SteamNetworkingIdentity()
+        ident.m_eType = _K_ESteamNetworkingIdentityType_SteamID
+        ident.m_cbSize = 8   # sizeof(m_steamID64), matching SetSteamID64()
+        ident.m_steamID64 = int(steam_id64) & 0xFFFFFFFFFFFFFFFF
+        return ident
+
+    def _init_networking(self):
+        if not self._net_symbols_ok:
+            LOG.info("Steam P2P: networking symbols unavailable; tunnel disabled.")
+            return
+        try:
+            self._net = self._dll.SteamAPI_SteamNetworkingMessages_SteamAPI_v002()
+        except Exception as exc:
+            self._net = None
+            LOG.warning("Steam P2P: failed to acquire NetworkingMessages interface: %s", exc)
+            return
+        if not self._net:
+            LOG.warning("Steam P2P: NetworkingMessages interface is null.")
+            return
+        # SessionRequest_t is a normal broadcast callback under manual dispatch.
+        self.register_callback(_K_iSteamNetworkingMessagesSessionRequest,
+                               self._on_session_request_cb)
+        LOG.info("Steam P2P: ISteamNetworkingMessages ready.")
+
+    def _net_teardown(self):
+        self._net = None
+
+    def _net_drain_cmds(self):
+        if not self._net:
+            # Drop any queued work if networking never came up.
+            try:
+                while True:
+                    self._net_cmds.get_nowait()
+            except queue.Empty:
+                return
+        while True:
+            try:
+                op, peer, data, channel, flags = self._net_cmds.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                if op == "send":
+                    self._net_send_raw(peer, data, channel, flags)
+                elif op == "accept":
+                    self._net_accept_raw(peer)
+                elif op == "close":
+                    self._net_close_raw(peer)
+            except Exception as exc:
+                LOG.debug("Steam P2P: cmd %s peer=%s failed: %s", op, peer, exc)
+
+    def _net_send_raw(self, peer: int, data: bytes, channel: int, flags: int):
+        if not self._net or not data:
+            return
+        ident = self._make_identity(peer)
+        buf = (ctypes.c_char * len(data)).from_buffer_copy(data)
+        res = self._dll.SteamAPI_ISteamNetworkingMessages_SendMessageToUser(
+            self._net, ctypes.byref(ident), ctypes.cast(buf, ctypes.c_void_p),
+            len(data), flags, channel)
+        if res != _K_EResultOK:
+            LOG.debug("Steam P2P: SendMessageToUser peer=%s ch=%s -> EResult %s",
+                      peer, channel, res)
+
+    def _net_accept_raw(self, peer: int):
+        if not self._net:
+            return
+        ident = self._make_identity(peer)
+        self._dll.SteamAPI_ISteamNetworkingMessages_AcceptSessionWithUser(
+            self._net, ctypes.byref(ident))
+
+    def _net_close_raw(self, peer: int):
+        if not self._net:
+            return
+        ident = self._make_identity(peer)
+        self._dll.SteamAPI_ISteamNetworkingMessages_CloseSessionWithUser(
+            self._net, ctypes.byref(ident))
+
+    def _on_session_request_cb(self, raw: bytes):
+        # raw == SteamNetworkingMessagesSessionRequest_t == one SteamNetworkingIdentity.
+        if len(raw) < 16:
+            return
+        peer = struct.unpack_from("<Q", raw, 8)[0]   # m_steamID64 @ offset 8
+        if not peer:
+            return
+        with self._lock:
+            handler = self._session_request_handler
+        accept = False
+        if handler is not None:
+            try:
+                accept = bool(handler(peer))
+            except Exception as exc:
+                LOG.debug("Steam P2P: session-request handler error: %s", exc)
+                accept = False
+        if accept:
+            self._net_accept_raw(peer)
+            LOG.info("Steam P2P: accepted session from peer %s", peer)
+        else:
+            LOG.debug("Steam P2P: ignored session request from peer %s", peer)
+
+    def _net_receive(self):
+        if not self._net:
+            return
+        with self._lock:
+            receivers = tuple(self._net_receivers)
+        if not receivers:
+            return
+        recv = self._dll.SteamAPI_ISteamNetworkingMessages_ReceiveMessagesOnChannel
+        max_msgs = 64
+        arr = (ctypes.c_void_p * max_msgs)()
+        for channel in self._net_recv_channels:
+            try:
+                n = recv(self._net, channel, arr, max_msgs)
+            except Exception as exc:
+                LOG.debug("Steam P2P: receive on ch%s failed: %s", channel, exc)
+                continue
+            for i in range(n):
+                ptr = arr[i]
+                if not ptr:
+                    continue
+                peer = 0
+                ch = channel
+                data = b""
+                release = None
+                try:
+                    m = _SteamNetworkingMessage_t.from_address(ptr)
+                    size = int(m.m_cbSize)
+                    data = ctypes.string_at(m.m_pData, size) if (m.m_pData and size > 0) else b""
+                    peer = int(m.m_identityPeer.m_steamID64)
+                    ch = int(m.m_nChannel)
+                    release = ctypes.cast(m.m_pfnRelease, _MSG_RELEASE_FN)
+                except Exception as exc:
+                    LOG.debug("Steam P2P: message parse error: %s", exc)
+                finally:
+                    # Always release the message back to Steam.
+                    if release is not None:
+                        try:
+                            release(ptr)
+                        except Exception:
+                            pass
+                if not peer:
+                    continue
+                for fn in receivers:
+                    try:
+                        fn(peer, data, ch)
+                    except Exception as exc:
+                        LOG.debug("Steam P2P: receiver error: %s", exc)
+
+
+# Process-wide Steam client (created lazily by the app; None until init).
+STEAM: Optional[Steam] = None
+
+
+# ===========================================================================
+# Steam P2P transport tunnel (Wave 1)
+# ---------------------------------------------------------------------------
+# These classes turn a reliable Steam P2P session into a byte-transparent stand-in
+# for the game's TCP stream, so `_run_tcp_bridge` (the relay) and the game's
+# `OLTogetherLink extends TcpLink` both keep working unchanged:
+#
+#   Host:   remote Steam peer  <== Steam ch0 ==>  [SteamHostAdapter]  <== loopback TCP ==>  relay
+#   Client: local game  <== loopback TCP ==>  [SteamClientPump]  <== Steam ch0 ==>  host
+#
+# The DATA channel (ch0) carries opaque bytes in order (reliable == TCP
+# semantics, and ISteamNetworkingMessages preserves message boundaries, so the
+# game's newline framing is untouched). A small CTRL channel carries session
+# open/close so loopback connections are created and torn down at the right
+# time without ever being confused for stream data.
+# ===========================================================================
+
+# CTRL-channel opcodes (reliable, tiny). Kept off the DATA channel so they can
+# never be mistaken for game bytes.
+_STEAM_CTRL_OPEN = b"OPEN"      # client -> host: local game connected; open a relay link
+_STEAM_CTRL_CLOSE = b"CLOSE"    # client -> host: local game disconnected; drop relay link
+_STEAM_CTRL_READY = b"READY"    # host -> client: relay link established
+_STEAM_CTRL_CLOSED = b"CLOSED"  # host -> client: relay link dropped (full / stopped)
+_STEAM_CTRL_PING = b"PING"      # either -> keepalive probe
+_STEAM_CTRL_PONG = b"PONG"      # reply to PING
+
+
+class _SteamPeerLink:
+    """Host-side per-peer bridge: one loopback TCP connection to the relay,
+    pumped byte-for-byte against a single remote Steam peer's DATA channel."""
+
+    def __init__(self, adapter: "SteamHostAdapter", peer_id: int):
+        self.adapter = adapter
+        self.peer_id = peer_id
+        self.sock: Optional[socket.socket] = None
+        self._alive = False
+        self._lock = threading.Lock()
+        self._reader: Optional[threading.Thread] = None
+
+    def open(self) -> bool:
+        try:
+            s = socket.create_connection(
+                (self.adapter.relay_host, self.adapter.relay_port), timeout=5.0)
+            s.settimeout(None)
+            try:
+                s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except Exception:
+                pass
+        except Exception as exc:
+            LOG.warning("Steam host adapter: peer %s could not reach relay %s:%s (%s)",
+                        self.peer_id, self.adapter.relay_host, self.adapter.relay_port, exc)
+            return False
+        with self._lock:
+            self.sock = s
+            self._alive = True
+        self._reader = threading.Thread(
+            target=self._read_loop, name=f"SteamPeerLink-{self.peer_id}", daemon=True)
+        self._reader.start()
+        LOG.info("Steam host adapter: peer %s linked to relay.", self.peer_id)
+        return True
+
+    def _read_loop(self):
+        # relay -> Steam peer (DATA channel)
+        while True:
+            with self._lock:
+                s = self.sock if self._alive else None
+            if s is None:
+                break
+            try:
+                chunk = s.recv(READ_CHUNK)
+            except OSError:
+                break
+            except Exception:
+                break
+            if not chunk:
+                break
+            steam = self.adapter.steam
+            if steam is not None:
+                steam.net_send(self.peer_id, chunk, STEAM_NET_CH_DATA, reliable=True)
+        # Socket closed by relay (disconnect / room full / stop).
+        self.adapter._on_link_dropped(self.peer_id)
+
+    def send_to_relay(self, data: bytes):
+        # Steam peer (DATA) -> relay
+        with self._lock:
+            s = self.sock if self._alive else None
+        if s is None:
+            return
+        try:
+            s.sendall(data)
+        except Exception:
+            self.adapter._on_link_dropped(self.peer_id)
+
+    def close(self):
+        with self._lock:
+            self._alive = False
+            s = self.sock
+            self.sock = None
+        if s is not None:
+            try:
+                s.shutdown(socket.SHUT_RDWR)
+            except Exception:
+                pass
+            try:
+                s.close()
+            except Exception:
+                pass
+
+
+class SteamHostAdapter:
+    """Presents remote Steam peers to the existing asyncio relay as ordinary
+    loopback TCP clients. The relay's CID assignment, FROM/broadcast, auth and
+    player-limit logic all keep working with zero changes.
+
+    Thread model: Steam callbacks arrive on the Steam thread and are handed to a
+    single worker thread (never do socket I/O on the Steam thread). Each peer
+    then gets its own `_SteamPeerLink` with a dedicated socket-reader thread.
+    """
+
+    def __init__(self, steam: Steam, relay_port: int,
+                 relay_host: str = "127.0.0.1",
+                 is_member: Optional[Callable[[int], bool]] = None):
+        self.steam = steam
+        self.relay_host = relay_host
+        self.relay_port = relay_port
+        self.is_member = is_member or (lambda _peer: True)
+        self._links: Dict[int, _SteamPeerLink] = {}
+        self._lock = threading.Lock()
+        self._inbox: "queue.Queue" = queue.Queue()
+        self._worker: Optional[threading.Thread] = None
+        self._running = False
+        # Anti-flap state: a game whose TcpLink reconnect-loop must never turn
+        # into a Steam message storm. Each peer gets a linger timer (hold the
+        # relay link briefly after CLOSE so a quick reconnect reuses it) and a
+        # min interval between actual relay links.
+        self._linger: Dict[int, threading.Timer] = {}
+        self._last_open: Dict[int, float] = {}
+        self._MIN_OPEN_GAP = 1.0   # seconds between actual relay-link creates
+        self._LINGER = 2.5         # seconds a relay link survives CLOSE
+
+    def start(self):
+        if self._running or self.steam is None or not self.steam.net_available:
+            if self.steam is None or not self.steam.net_available:
+                LOG.info("Steam host adapter: Steam P2P unavailable; not started.")
+            return
+        self._running = True
+        self.steam.set_session_request_handler(self._on_session_request)
+        self.steam.add_net_receiver(self._on_net)
+        self._worker = threading.Thread(target=self._work, name="SteamHostAdapter", daemon=True)
+        self._worker.start()
+        LOG.info("Steam host adapter: listening for peers -> relay %s:%s",
+                 self.relay_host, self.relay_port)
+
+    def stop(self):
+        if not self._running:
+            return
+        self._running = False
+        if self.steam is not None:
+            self.steam.set_session_request_handler(None)
+            self.steam.remove_net_receiver(self._on_net)
+        with self._lock:
+            timers = list(self._linger.values())
+            self._linger.clear()
+            links = list(self._links.values())
+            self._links.clear()
+        for t in timers:
+            try:
+                t.cancel()
+            except Exception:
+                pass
+        for link in links:
+            link.close()
+            try:
+                self.steam.net_close(link.peer_id)
+            except Exception:
+                pass
+        self._inbox.put(None)   # wake worker to exit
+
+    # -- Steam-thread callbacks (must be quick) ----------------------------
+
+    def _on_session_request(self, peer_id: int) -> bool:
+        try:
+            allowed = bool(self.is_member(peer_id))
+        except Exception:
+            allowed = False
+        if not allowed:
+            LOG.info("Steam host adapter: rejecting session from non-member %s", peer_id)
+        return allowed
+
+    def _on_net(self, peer_id: int, data: bytes, channel: int):
+        self._inbox.put((peer_id, channel, data))
+
+    # -- Worker thread -----------------------------------------------------
+
+    def _work(self):
+        while self._running:
+            item = self._inbox.get()
+            if item is None:
+                break
+            peer_id, channel, data = item
+            try:
+                if channel == STEAM_NET_CH_CTRL:
+                    self._handle_ctrl(peer_id, data)
+                elif channel == STEAM_NET_CH_DATA:
+                    self._handle_data(peer_id, data)
+            except Exception as exc:
+                LOG.debug("Steam host adapter: dispatch error peer=%s: %s", peer_id, exc)
+
+    def _handle_ctrl(self, peer_id: int, data: bytes):
+        if data == _STEAM_CTRL_OPEN:
+            self._open_link(peer_id)
+        elif data == _STEAM_CTRL_CLOSE:
+            self._schedule_close(peer_id)
+        elif data == _STEAM_CTRL_PING:
+            self.steam.net_send(peer_id, _STEAM_CTRL_PONG, STEAM_NET_CH_CTRL, reliable=True)
+        elif data == _STEAM_CTRL_PONG:
+            pass
+
+    def _handle_data(self, peer_id: int, data: bytes):
+        with self._lock:
+            link = self._links.get(peer_id)
+        if link is None:
+            # Data before OPEN — tolerate by opening the link lazily.
+            link = self._open_link(peer_id)
+        if link is not None and data:
+            link.send_to_relay(data)
+
+    def _open_link(self, peer_id: int) -> Optional[_SteamPeerLink]:
+        # A pending linger close means the game briefly dropped and reconnected:
+        # cancel the teardown and reuse the existing relay link (keeps the same
+        # relay CID and avoids a reconnect storm).
+        self._cancel_linger(peer_id)
+        with self._lock:
+            existing = self._links.get(peer_id)
+            if existing is not None:
+                # Re-arm READY (cheap, idempotent) so the client knows we're live.
+                self.steam.net_send(peer_id, _STEAM_CTRL_READY, STEAM_NET_CH_CTRL, reliable=True)
+                return existing
+            # Rate-limit actual relay-link creation so a flapping game cannot
+            # spin up loopback connections (and Steam traffic) without bound.
+            last = self._last_open.get(peer_id, 0.0)
+            if _now() - last < self._MIN_OPEN_GAP:
+                return None
+            self._last_open[peer_id] = _now()
+        LOG.info("Steam host adapter: peer %s OPEN -> connecting to relay", peer_id)
+        link = _SteamPeerLink(self, peer_id)
+        if not link.open():
+            self.steam.net_send(peer_id, _STEAM_CTRL_CLOSED, STEAM_NET_CH_CTRL, reliable=True)
+            return None
+        with self._lock:
+            self._links[peer_id] = link
+        self.steam.net_send(peer_id, _STEAM_CTRL_READY, STEAM_NET_CH_CTRL, reliable=True)
+        return link
+
+    def _schedule_close(self, peer_id: int):
+        # Debounce: hold the relay link for a short linger so a rapid game
+        # reconnect reuses it instead of churning a new one.
+        with self._lock:
+            if peer_id not in self._links:
+                return
+            old = self._linger.pop(peer_id, None)
+            if old is not None:
+                old.cancel()
+            timer = threading.Timer(self._LINGER, self._linger_expired, args=(peer_id,))
+            timer.daemon = True
+            self._linger[peer_id] = timer
+            timer.start()
+
+    def _cancel_linger(self, peer_id: int):
+        with self._lock:
+            t = self._linger.pop(peer_id, None)
+        if t is not None:
+            t.cancel()
+
+    def _linger_expired(self, peer_id: int):
+        with self._lock:
+            self._linger.pop(peer_id, None)
+        LOG.info("Steam host adapter: peer %s linger expired -> closing relay link", peer_id)
+        self._close_link(peer_id, notify_peer=True)
+
+    def _close_link(self, peer_id: int, notify_peer: bool):
+        self._cancel_linger(peer_id)
+        with self._lock:
+            link = self._links.pop(peer_id, None)
+            self._last_open.pop(peer_id, None)
+        if link is not None:
+            link.close()
+        if notify_peer and self.steam is not None:
+            self.steam.net_send(peer_id, _STEAM_CTRL_CLOSED, STEAM_NET_CH_CTRL, reliable=True)
+
+    def _on_link_dropped(self, peer_id: int):
+        # Called from a peer link's reader thread when the relay side closes.
+        self._cancel_linger(peer_id)
+        with self._lock:
+            link = self._links.pop(peer_id, None)
+            self._last_open.pop(peer_id, None)
+        if link is not None:
+            link.close()
+            if self.steam is not None:
+                self.steam.net_send(peer_id, _STEAM_CTRL_CLOSED, STEAM_NET_CH_CTRL, reliable=True)
+            LOG.info("Steam host adapter: peer %s relay link closed.", peer_id)
+
+
+class SteamClientPump:
+    """Client-side tunnel: a local TCP listener the game connects to, pumped
+    over a reliable Steam P2P session to the host's SteamID. The game's
+    `ServerIP` is pointed at 127.0.0.1 so `OLTogetherLink` needs no change."""
+
+    def __init__(self, steam: Steam, host_steam_id: int,
+                 listen_host: str = "127.0.0.1", listen_port: int = RELAY_PORT):
+        self.steam = steam
+        self.host_id = int(host_steam_id)
+        self.listen_host = listen_host
+        self.listen_port = listen_port
+        self._srv: Optional[socket.socket] = None
+        self._game_sock: Optional[socket.socket] = None
+        self._sock_lock = threading.Lock()
+        self._inbox: "queue.Queue" = queue.Queue()
+        self._worker: Optional[threading.Thread] = None
+        self._accept_thread: Optional[threading.Thread] = None
+        self._handshake_thread: Optional[threading.Thread] = None
+        self._running = False
+        self.ready = threading.Event()
+        # Anti-flap: throttle OPEN and debounce CLOSE so a game whose TcpLink
+        # reconnect-loops (e.g. before a host session exists) can never turn into
+        # a Steam control-message storm.
+        self._last_open_sent = 0.0
+        self._OPEN_GAP = 1.0          # min seconds between OPEN sends
+        self._CLOSE_DEBOUNCE = 1.5    # wait before telling host the game left
+        self._close_timer: Optional[threading.Timer] = None
+        self._ctrl_lock = threading.Lock()
+
+    def start(self) -> bool:
+        if self._running:
+            return True
+        if self.steam is None or not self.steam.net_available:
+            LOG.warning("Steam client pump: Steam P2P unavailable; cannot join.")
+            return False
+        srv = None
+        # Try the preferred port first; if it's taken (e.g. two instances on one
+        # machine, or a host relay already on 7777), fall back to an OS-assigned
+        # free port. The game is launched against whatever we actually bind, so
+        # the user never has to pick a port to join.
+        for want in (self.listen_port, 0):
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                # Deliberately NOT SO_REUSEADDR: on Windows it lets two sockets
+                # share one port silently, which would let the host relay hijack
+                # the game's connection to our tunnel. SO_EXCLUSIVEADDRUSE forces a
+                # clean bind failure on a busy port so the fallback below kicks in.
+                if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+                    try:
+                        s.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+                    except OSError:
+                        pass
+                s.bind((self.listen_host, want))
+                s.listen(4)
+                srv = s
+                break
+            except Exception as exc:
+                try:
+                    s.close()
+                except Exception:
+                    pass
+                LOG.info("Steam client pump: port %s unavailable (%s)%s",
+                         want, exc, "; trying an auto-assigned port" if want else "")
+        if srv is None:
+            LOG.warning("Steam client pump: could not bind any local port on %s", self.listen_host)
+            return False
+        # Reflect the port we actually got so callers can launch the game at it.
+        self.listen_port = srv.getsockname()[1]
+        self._srv = srv
+        self._running = True
+        self.steam.add_net_receiver(self._on_net)
+        self._worker = threading.Thread(target=self._work, name="SteamClientPump-rx", daemon=True)
+        self._worker.start()
+        self._accept_thread = threading.Thread(target=self._accept_loop, name="SteamClientPump-acc", daemon=True)
+        self._accept_thread.start()
+        self._handshake_thread = threading.Thread(target=self._handshake_loop, name="SteamClientPump-hs", daemon=True)
+        self._handshake_thread.start()
+        # Establish the session up front so the host accepts us before the game
+        # connects (reliable messages are queued through the handshake).
+        self.steam.net_send(self.host_id, _STEAM_CTRL_PING, STEAM_NET_CH_CTRL, reliable=True)
+        LOG.info("Steam client pump: listening on %s:%s, tunneling to host %s",
+                 self.listen_host, self.listen_port, self.host_id)
+        return True
+
+    def stop(self):
+        if not self._running:
+            return
+        self._running = False
+        self._cancel_close_timer()
+        if self.steam is not None:
+            self.steam.remove_net_receiver(self._on_net)
+            try:
+                self.steam.net_send(self.host_id, _STEAM_CTRL_CLOSE, STEAM_NET_CH_CTRL, reliable=True)
+                self.steam.net_close(self.host_id)
+            except Exception:
+                pass
+        self._close_game_sock()
+        try:
+            if self._srv:
+                self._srv.close()
+        except Exception:
+            pass
+        self._srv = None
+        self._inbox.put(None)
+
+    # -- accept + per-connection socket reader -----------------------------
+
+    def _handshake_loop(self):
+        # Nudge the host until it acknowledges our link. All CTRL opcodes are
+        # idempotent, so repeats during session establishment are harmless if
+        # some are dropped before the reliable channel is fully up.
+        deadline = _now() + 30.0
+        while self._running and not self.ready.is_set() and _now() < deadline:
+            with self._sock_lock:
+                have_game = self._game_sock is not None
+            try:
+                if have_game:
+                    self._send_open_throttled()
+                else:
+                    self.steam.net_send(self.host_id, _STEAM_CTRL_PING, STEAM_NET_CH_CTRL, reliable=True)
+            except Exception:
+                pass
+            time.sleep(1.0)
+
+    def _send_open_throttled(self):
+        # Coalesce OPENs so a reconnect-looping game cannot spam Steam.
+        with self._ctrl_lock:
+            if _now() - self._last_open_sent < self._OPEN_GAP:
+                return
+            self._last_open_sent = _now()
+        if self.steam is not None:
+            self.steam.net_send(self.host_id, _STEAM_CTRL_OPEN, STEAM_NET_CH_CTRL, reliable=True)
+
+    def _cancel_close_timer(self):
+        with self._ctrl_lock:
+            t = self._close_timer
+            self._close_timer = None
+        if t is not None:
+            t.cancel()
+
+    def _schedule_close(self):
+        # Debounce CLOSE: if the game reconnects within the window (a flap),
+        # we cancel this and reuse the tunnel instead of churning it.
+        with self._ctrl_lock:
+            if self._close_timer is not None:
+                self._close_timer.cancel()
+            if not self._running:
+                return
+            t = threading.Timer(self._CLOSE_DEBOUNCE, self._fire_close)
+            t.daemon = True
+            self._close_timer = t
+            t.start()
+
+    def _fire_close(self):
+        with self._ctrl_lock:
+            self._close_timer = None
+            # Only actually CLOSE if no game reconnected in the meantime.
+        with self._sock_lock:
+            has_game = self._game_sock is not None
+        if has_game:
+            return
+        if self._running and self.steam is not None:
+            self.steam.net_send(self.host_id, _STEAM_CTRL_CLOSE, STEAM_NET_CH_CTRL, reliable=True)
+
+    def _accept_loop(self):
+        while self._running and self._srv is not None:
+            try:
+                conn, _addr = self._srv.accept()
+            except OSError:
+                break
+            except Exception:
+                if self._running:
+                    continue
+                break
+            try:
+                conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except Exception:
+                pass
+            # A reconnect cancels any pending CLOSE so the host reuses our link.
+            self._cancel_close_timer()
+            # Only one game connection at a time; replace any previous.
+            self._close_game_sock()
+            with self._sock_lock:
+                self._game_sock = conn
+            LOG.info("Steam client pump: local game connected from %s -> host %s",
+                     _addr, self.host_id)
+            # Tell the host to (re)open its relay link for us (throttled).
+            self._send_open_throttled()
+            self._read_game(conn)
+
+    def _read_game(self, conn: socket.socket):
+        # local game -> Steam host (DATA channel)
+        first = True
+        while self._running:
+            try:
+                chunk = conn.recv(READ_CHUNK)
+            except OSError:
+                break
+            except Exception:
+                break
+            if not chunk:
+                break
+            if first:
+                LOG.info("Steam client pump: first %dB from game -> host DATA channel", len(chunk))
+                first = False
+            if self.steam is not None:
+                self.steam.net_send(self.host_id, chunk, STEAM_NET_CH_DATA, reliable=True)
+        # game disconnected locally
+        with self._sock_lock:
+            if self._game_sock is conn:
+                self._game_sock = None
+        try:
+            conn.close()
+        except Exception:
+            pass
+        # Debounced: a flapping game won't storm the host with CLOSE/OPEN.
+        if self._running:
+            self._schedule_close()
+
+    def _close_game_sock(self):
+        with self._sock_lock:
+            s = self._game_sock
+            self._game_sock = None
+        if s is not None:
+            try:
+                s.shutdown(socket.SHUT_RDWR)
+            except Exception:
+                pass
+            try:
+                s.close()
+            except Exception:
+                pass
+
+    # -- Steam receive side ------------------------------------------------
+
+    def _on_net(self, peer_id: int, data: bytes, channel: int):
+        if peer_id != self.host_id:
+            return   # ignore anything not from our host
+        self._inbox.put((channel, data))
+
+    def _work(self):
+        while self._running:
+            item = self._inbox.get()
+            if item is None:
+                break
+            channel, data = item
+            try:
+                if channel == STEAM_NET_CH_DATA:
+                    self._write_game(data)
+                elif channel == STEAM_NET_CH_CTRL:
+                    self._handle_ctrl(data)
+            except Exception as exc:
+                LOG.debug("Steam client pump: dispatch error: %s", exc)
+
+    def _write_game(self, data: bytes):
+        with self._sock_lock:
+            s = self._game_sock
+        if s is None or not data:
+            return
+        try:
+            s.sendall(data)
+        except Exception:
+            self._close_game_sock()
+
+    def _handle_ctrl(self, data: bytes):
+        if data == _STEAM_CTRL_READY:
+            self.ready.set()
+            LOG.info("Steam client pump: host relay link is ready.")
+        elif data == _STEAM_CTRL_CLOSED:
+            LOG.info("Steam client pump: host closed the relay link.")
+            self._close_game_sock()
+        elif data == _STEAM_CTRL_PING:
+            self.steam.net_send(self.host_id, _STEAM_CTRL_PONG, STEAM_NET_CH_CTRL, reliable=True)
+        elif data == _STEAM_CTRL_PONG:
+            pass
 
 
 @dataclass
@@ -1580,9 +2882,16 @@ class OLTogetherApp(tk.Tk):
         self.theme_var = tk.StringVar(value="Cyan")
         self.theme_dark_var = tk.BooleanVar(value=True)
         self.mic_var = tk.StringVar(value="Default")
+        self.use_steam_name_var = tk.BooleanVar(value=False)
         self.voice_input_gain_var = tk.DoubleVar(value=1.0)
         self.voice_noise_gate_var = tk.DoubleVar(value=0.02)
         self.voice_output_volume_var = tk.DoubleVar(value=1.0)
+        # Steam P2P (Wave 1). steam is set once background init succeeds.
+        self.steam_join_var = tk.StringVar(value="")
+        self.steam_status_var = tk.StringVar(value="Steam: connecting…")
+        self.steam: Optional[Steam] = None
+        self._steam_host: Optional[SteamHostAdapter] = None
+        self._steam_client: Optional[SteamClientPump] = None
         self._mic_meter = None
         self._mic_monitor = None
         self.server_running = False
@@ -1616,6 +2925,7 @@ class OLTogetherApp(tk.Tk):
         self.after(500, self._tick_stats)
         self.after(1000, self._refresh_browser)
         self.after(2000, self._check_for_updates)
+        self.after(300, self._init_steam_async)
         self._boot_slide_in()
 
     def _build_ui(self):
@@ -1989,6 +3299,7 @@ class OLTogetherApp(tk.Tk):
         self._host_entry.bind("<Control-v>", self._reveal_host_ip)
         self._host_entry.bind("<Button-1>", self._reveal_host_ip)
         self._field(card, 11, "Player Name", self.name_var)
+        self._checkbox(card, 11, 2, "Use Steam Name", self.use_steam_name_var)
         extra_frame = tk.Frame(card, bg=self.CARD)
         extra_frame.grid(row=12, column=0, columnspan=4, sticky="ew", pady=(4, 0))
         extra_frame.columnconfigure(1, weight=1)
@@ -2146,6 +3457,27 @@ class OLTogetherApp(tk.Tk):
         ms_list_frame.grid(row=6, column=0, columnspan=2, sticky="ew")
         self._ms_list_frame = ms_list_frame
         self._ms_rebuild_list()
+
+        # ---- Steam P2P (Wave 1: temporary join-by-SteamID64) ----
+        steam_header = tk.Frame(card, bg=self.CARD)
+        steam_header.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(10, 2))
+        tk.Label(steam_header, text="STEAM (P2P)", font=(APP_FONT, 9, "bold"),
+                 bg=self.CARD, fg=self.CYAN).pack(side="left")
+        tk.Label(steam_header, textvariable=self.steam_status_var, font=(APP_FONT, 8),
+                 bg=self.CARD, fg=self.DIM).pack(side="right")
+
+        steam_row = tk.Frame(card, bg=self.CARD)
+        steam_row.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(0, 2))
+        steam_row.columnconfigure(1, weight=1)
+        tk.Label(steam_row, text="Host SteamID64", font=(APP_FONT, 9), bg=self.CARD,
+                 fg=self.DIM).grid(row=0, column=0, padx=(0, 6))
+        steam_entry = tk.Entry(steam_row, textvariable=self.steam_join_var, bg=self.INPUT_BG,
+                               fg=self.TEXT, insertbackground=self.CYAN, font=(APP_FONT, 9),
+                               relief="flat", highlightthickness=1, highlightbackground=self.BORDER,
+                               highlightcolor=self.CYAN)
+        steam_entry.grid(row=0, column=1, sticky="ew", padx=(0, 8))
+        steam_join_btn = self._neon_button(steam_row, "JOIN VIA STEAM", self._join_steam, self.GREEN)
+        steam_join_btn.grid(row=0, column=2)
 
     def _build_footer(self, parent):
         footer = tk.Frame(parent, bg=self.BG)
@@ -2356,6 +3688,7 @@ class OLTogetherApp(tk.Tk):
                 lbl = self._arch_labels.get(self.game_arch_var.get(), "64-bit")
                 self._arch_label_var.set(lbl)
             self.name_var.set(data.get("player_name", self.name_var.get()))
+            self.use_steam_name_var.set(data.get("use_steam_name", False))
             self.host_var.set(data.get("host", self.host_var.get()))
             self.port_var.set(str(data.get("port", self.port_var.get())))
             room = data.get("room", {})
@@ -2412,6 +3745,7 @@ class OLTogetherApp(tk.Tk):
             "game_arch": self.game_arch_var.get().strip() or "Win64",
             "game_extra_args": self.game_extra_args_var.get().strip(),
             "player_name": self.name_var.get().strip(),
+            "use_steam_name": self.use_steam_name_var.get(),
             "host": self.host_var.get().strip(),
             "port": self.port_var.get().strip(),
             "room": self._room_config().to_dict() | {"password": self.password_var.get().strip()},
@@ -2476,6 +3810,100 @@ class OLTogetherApp(tk.Tk):
     def stop_discovery_responder(self):
         self.responder.stop()
 
+    def _init_steam_async(self):
+        """Best-effort Steam bring-up on a background thread so the UI never
+        blocks. On success the Steam P2P join/host affordances light up; on
+        failure the app silently keeps using the TCP/LAN/master-server path."""
+        if self.steam is not None:
+            return
+
+        def worker():
+            try:
+                st = Steam(app_id=STEAM_APP_ID)
+                ok = st.init()
+            except Exception as exc:
+                self.after(0, lambda e=exc: self._on_steam_failed(str(e)))
+                return
+            if ok:
+                # init() returns once identity is ready, but the networking
+                # interface is acquired a beat later on the Steam thread. Wait
+                # briefly so the P2P status we report to the UI is accurate.
+                for _ in range(50):
+                    if st.net_available:
+                        break
+                    time.sleep(0.1)
+                global STEAM
+                STEAM = st
+                self.after(0, lambda: self._on_steam_ready(st))
+            else:
+                self.after(0, lambda: self._on_steam_failed(st._init_error or "unavailable"))
+
+        threading.Thread(target=worker, name="SteamInit", daemon=True).start()
+
+    def _on_steam_ready(self, st: "Steam"):
+        self.steam = st
+        sid = st.get_steam_id()
+        persona = st.get_persona_name()
+        net = " P2P" if st.net_available else ""
+        self.steam_status_var.set(f"Steam{net}: {persona or 'ready'}  (SteamID64 {sid})")
+        self.log(f"Steam ready — SteamID64={sid} persona={persona!r} "
+                 f"P2P={'yes' if st.net_available else 'no'}")
+        if not st.net_available:
+            self.log("Steam is up but P2P networking is unavailable; joins will use TCP/LAN.")
+
+    def _on_steam_failed(self, why: str):
+        self.steam_status_var.set("Steam: not available (using TCP/LAN)")
+        self.log(f"Steam not available ({why}). Using TCP/LAN transport.")
+
+    def _stop_steam_host(self):
+        if self._steam_host is not None:
+            try:
+                self._steam_host.stop()
+            except Exception:
+                pass
+            self._steam_host = None
+
+    def _stop_steam_client(self):
+        if self._steam_client is not None:
+            try:
+                self._steam_client.stop()
+            except Exception:
+                pass
+            self._steam_client = None
+
+    def _join_steam(self):
+        """Temporary Wave 1 entry point: join a host by raw SteamID64. Wave 2
+        replaces this with lobby selection, but the transport path is identical."""
+        raw = self.steam_join_var.get().strip()
+        if not raw.isdigit() or len(raw) < 17:
+            messagebox.showwarning("Join by SteamID",
+                                   "Enter the host's 17-digit SteamID64.")
+            return
+        host_id = int(raw)
+        if not (self.steam and self.steam.net_available):
+            messagebox.showwarning("Steam Unavailable",
+                                   "Steam P2P is not available. Make sure Steam is "
+                                   "running, then relaunch.")
+            return
+        # The local tunnel port is chosen automatically. Prefer the standard game
+        # port for a clean single-machine setup, but the pump auto-falls back to a
+        # free port if it's busy (e.g. hosting + joining on one machine). The user
+        # never sets a port to join, and the saved host port is left untouched.
+        self._stop_steam_client()
+        pump = SteamClientPump(self.steam, host_id, listen_host="127.0.0.1",
+                               listen_port=RELAY_PORT)
+        if not pump.start():
+            self.log("Steam join failed: could not start local tunnel listener.")
+            messagebox.showwarning("Join Failed",
+                                   "Could not start the local Steam tunnel listener.")
+            return
+        self._steam_client = pump
+        local_port = pump.listen_port  # the port actually bound
+        # Point the game at our local tunnel; ServerIP=127.0.0.1 keeps the game's
+        # TcpLink unchanged. Pass as overrides so host_var/port_var stay as-is.
+        self.log(f"Joining Steam host {host_id} — launching game at 127.0.0.1:{local_port}")
+        self._launch(1, server_ip="127.0.0.1", server_port=local_port)
+
     def _start_host(self):
         host = self.host_var.get().strip() or _detect_local_host()
         if not self.host_var.get().strip():
@@ -2498,15 +3926,33 @@ class OLTogetherApp(tk.Tk):
         except Exception as exc:
             self.log(f"Voice relay failed to start: {exc}")
             self._voice_relay = None
+        # When Steam P2P is available, bind the relay on 0.0.0.0 so the loopback
+        # Steam adapter can connect alongside any direct LAN clients. The old
+        # LAN/TCP behaviour is preserved because 0.0.0.0 still accepts LAN.
+        steam_ok = bool(self.steam and self.steam.net_available)
+        bind_host = "0.0.0.0" if steam_ok else host
         loop = asyncio.new_event_loop()
         self._bridge_loop = loop
-        threading.Thread(target=lambda: loop.run_until_complete(_run_tcp_bridge(self, host, port, self.room)), daemon=True).start()
+        threading.Thread(target=lambda: loop.run_until_complete(_run_tcp_bridge(self, bind_host, port, self.room)), daemon=True).start()
         # Register with enabled master servers so remote players can see the room
         self._ms_start_heartbeat()
+        # Start the Steam P2P host adapter so friends can join by SteamID (Wave 2
+        # will gate this on lobby membership; Wave 1 accepts any peer).
+        if steam_ok:
+            try:
+                adapter = SteamHostAdapter(self.steam, relay_port=port, relay_host="127.0.0.1")
+                adapter.start()
+                self._steam_host = adapter
+                self.log(f"Steam P2P host active — friends can join by your SteamID64: "
+                         f"{self.steam.get_steam_id()}")
+            except Exception as exc:
+                self.log(f"Steam host adapter failed to start: {exc}")
+                self._steam_host = None
 
     def _stop_host(self):
         if not self.server_running:
             return
+        self._stop_steam_host()
         loop = self._bridge_loop
         shutdown = self._bridge_shutdown
         if loop is not None and shutdown is not None:
@@ -2525,7 +3971,7 @@ class OLTogetherApp(tk.Tk):
         self._voice_position_lookup = None
         self._ms_stop_heartbeat()
 
-    def _launch(self, role):
+    def _launch(self, role, server_ip=None, server_port=None):
         game_folder = self.game_path_var.get().strip()
         ok, missing = _validate_game_folder(game_folder)
         if not ok:
@@ -2538,8 +3984,14 @@ class OLTogetherApp(tk.Tk):
             messagebox.showwarning("Missing Game EXE", "OLGame.exe was not found in Binaries\\Win64 or Binaries\\Win32.")
             return
         player_name = self.name_var.get().strip() or ("HostPlayer" if role == 0 else "ClientPlayer")
-        host = self.host_var.get().strip() or _detect_local_host()
-        port = self.port_var.get().strip() or str(RELAY_PORT)
+        if self.use_steam_name_var.get() and self.steam is not None and self.steam.available:
+            steam_name = self.steam.get_persona_name()
+            if steam_name:
+                player_name = steam_name
+        # server_ip/server_port let the Steam join path point the game at the local
+        # tunnel (127.0.0.1:<auto-port>) without clobbering the saved host settings.
+        host = server_ip if server_ip is not None else (self.host_var.get().strip() or _detect_local_host())
+        port = str(server_port) if server_port is not None else (self.port_var.get().strip() or str(RELAY_PORT))
         room = self._room_config()
         self._save_settings()
         try:
@@ -2765,6 +4217,8 @@ class OLTogetherApp(tk.Tk):
         self._closing = True
         if self.server_running:
             self._stop_host()
+        self._stop_steam_client()
+        self._stop_steam_host()
         if self._voice_client is not None:
             try:
                 self._voice_client.stop()
@@ -2785,6 +4239,12 @@ class OLTogetherApp(tk.Tk):
             self.responder.stop()
         except Exception:
             pass
+        if self.steam is not None:
+            try:
+                self.steam.shutdown()
+            except Exception:
+                pass
+            self.steam = None
         self._save_settings()
         self._slide_out_and_close()
 
@@ -3215,7 +4675,236 @@ def _load_headless_config(path):
         return None
 
 
+def _make_console_utf8():
+    """Best-effort: make stdout/stderr tolerate non-ASCII on legacy consoles
+    (e.g. Windows cp932/cp1252) so log/print calls never raise
+    UnicodeEncodeError. No-op if the streams can't be reconfigured."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
+def _steam_selftest(duration: float = 8.0) -> int:
+    """Wave 0 smoke test: init Steam, print our SteamID64 + persona name, pump
+    callbacks for a few seconds, then shut down. Returns a process exit code
+    (0 = Steam came up, 1 = it didn't) so it's usable in scripts/CI."""
+    _make_console_utf8()
+    logging.basicConfig(level=logging.INFO,
+                        format="[%(asctime)s] %(message)s", datefmt="%H:%M:%S")
+    _ensure_steam_appid_file()
+    steam = Steam(app_id=STEAM_APP_ID)
+    if not steam.init():
+        print("STEAM SELFTEST: FAILED to initialise Steam "
+              "(is Steam running? is steam_appid.txt present?)")
+        return 1
+    print(f"STEAM SELFTEST: OK  SteamID64={steam.get_steam_id()}  "
+          f"persona={steam.get_persona_name()!r}")
+    print(f"Pumping callbacks for {duration:.0f}s - open the overlay with "
+          f"Shift+Tab to confirm the session is live.")
+    try:
+        time.sleep(duration)
+    except KeyboardInterrupt:
+        pass
+    steam.shutdown()
+    print("STEAM SELFTEST: clean shutdown.")
+    return 0
+
+
+def _steam_nettest(duration: float = 20.0, peer_id: int = 0) -> int:
+    """Wave 1 smoke test for the ISteamNetworkingMessages bindings.
+
+    Validates that the flat networking symbols resolve, the interface pointer is
+    acquired, and the receive/session-request pump runs without crashing over
+    the manual-dispatch loop. If a peer SteamID64 is supplied (second CLI arg),
+    it also opens a session and sends periodic reliable pings on the CTRL
+    channel and echoes anything it receives — run this on two machines/accounts
+    (each pointing at the other) to prove end-to-end P2P delivery.
+
+    Exit codes: 0 = networking interface came up, 1 = Steam/networking failed."""
+    _make_console_utf8()
+    logging.basicConfig(level=logging.INFO,
+                        format="[%(asctime)s] %(message)s", datefmt="%H:%M:%S")
+    _ensure_steam_appid_file()
+    steam = Steam(app_id=STEAM_APP_ID)
+    if not steam.init():
+        print("STEAM NETTEST: FAILED to initialise Steam "
+              "(is Steam running? is steam_appid.txt present?)")
+        return 1
+    # Give the Steam thread a moment to acquire the networking interface.
+    for _ in range(50):
+        if steam.net_available:
+            break
+        time.sleep(0.1)
+    if not steam.net_available:
+        print("STEAM NETTEST: Steam is up but ISteamNetworkingMessages is "
+              "unavailable — P2P transport cannot run on this build.")
+        steam.shutdown()
+        return 1
+    print(f"STEAM NETTEST: OK  networking ready.  SteamID64={steam.get_steam_id()}  "
+          f"persona={steam.get_persona_name()!r}")
+
+    rx_count = {"n": 0}
+
+    def on_rx(peer, data, channel):
+        rx_count["n"] += 1
+        preview = data[:48]
+        print(f"  RX from {peer} ch{channel} ({len(data)}B): {preview!r}")
+        # Reply to a peer's HELLO exactly once so both sides observe a round
+        # trip, but never echo an echo — otherwise two paired instances would
+        # amplify a single message into an unbounded feedback loop.
+        if channel == STEAM_NET_CH_DATA and data and not data.startswith(b"ECHO:"):
+            steam.net_send(peer, b"ECHO:" + data, STEAM_NET_CH_DATA, reliable=True)
+
+    def on_session(peer):
+        print(f"  SESSION REQUEST from {peer} -> accepting")
+        return True
+
+    steam.add_net_receiver(on_rx)
+    steam.set_session_request_handler(on_session)
+
+    if peer_id:
+        print(f"Opening session to peer {peer_id}; sending pings for {duration:.0f}s.")
+        steam.net_send(peer_id, b"NETTEST-HELLO", STEAM_NET_CH_DATA, reliable=True)
+    else:
+        print(f"No peer id given — passive mode. Waiting {duration:.0f}s for inbound "
+              f"sessions. (Pass a SteamID64 as the next arg to actively connect.)")
+
+    end = _now() + duration
+    try:
+        while _now() < end:
+            if peer_id:
+                steam.net_send(peer_id, _STEAM_CTRL_PING, STEAM_NET_CH_CTRL, reliable=True)
+            time.sleep(1.0)
+    except KeyboardInterrupt:
+        pass
+
+    steam.remove_net_receiver(on_rx)
+    steam.set_session_request_handler(None)
+    if peer_id:
+        steam.net_close(peer_id)
+    steam.shutdown()
+    print(f"STEAM NETTEST: clean shutdown.  messages received={rx_count['n']}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# build_launcher — bundle OutlastTogether.py into a single .exe via PyInstaller
+# ---------------------------------------------------------------------------
+
+def build_launcher():
+    """Build OutlastLauncher.exe using PyInstaller.
+
+    Bundles the Python script, JetBrains Mono font, app icon, and
+    server_config.json into a single-folder distribution.
+    """
+    import shutil
+
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    src_script = os.path.join(script_dir, "OutlastTogether.py")
+    output_dir = os.path.join(script_dir, "dist")
+    exe_name = "OutlastLauncher"
+
+    # Data files to bundle alongside the exe
+    data_files = []
+    for fname in ("JetBrainsMono-Bold.ttf", "app_icon.ico", "app_icon.png",
+                   "server_config.json"):
+        fpath = os.path.join(script_dir, fname)
+        if os.path.isfile(fpath):
+            data_files.append(fpath)
+
+    # Verify PyInstaller is available
+    pyinstaller = shutil.which("pyinstaller")
+    if not pyinstaller:
+        print("[ERROR] pyinstaller not found.  Install with: pip install pyinstaller")
+        return False
+
+    print(f"[BUILD] Source:  {src_script}")
+    print(f"[BUILD] Output:  {output_dir}\\{exe_name}.exe")
+    if data_files:
+        print(f"[BUILD] Data:    {', '.join(os.path.basename(f) for f in data_files)}")
+
+    # Build the command
+    cmd = [
+        sys.executable, "-m", "PyInstaller",
+        "--noconfirm",           # overwrite existing build
+        "--onefile",             # single exe
+        "--windowed",            # no console window (GUI app)
+        "--name", exe_name,
+        "--distpath", output_dir,
+        "--workpath", os.path.join(script_dir, "build"),
+        "--specpath", script_dir,
+    ]
+
+    # Add --icon if app_icon.ico exists
+    ico = os.path.join(script_dir, "app_icon.ico")
+    if os.path.isfile(ico):
+        cmd += ["--icon", ico]
+
+    # Add --add-data for each bundled file
+    sep = ";" if sys.platform == "win32" else ":"
+    for fpath in data_files:
+        cmd += ["--add-data", f"{fpath}{sep}."]
+
+    # Hidden imports that may not be auto-detected
+    cmd += [
+        "--hidden-import", "asyncio",
+        "--hidden-import", "tkinter",
+        "--hidden-import", "tkinter.ttk",
+        "--hidden-import", "json",
+        "--hidden-import", "ctypes",
+        "--hidden-import", "ctypes.wintypes",
+        "--hidden-import", "socket",
+        "--hidden-import", "struct",
+        "--hidden-import", "threading",
+        "--hidden-import", "hashlib",
+        "--hidden-import", "urllib.request",
+        "--hidden-import", "webbrowser",
+    ]
+
+    # The script itself
+    cmd.append(src_script)
+
+    print(f"[BUILD] Running: {' '.join(cmd[:8])} ...")
+    print()
+
+    result = subprocess.run(cmd, cwd=script_dir)
+
+    if result.returncode != 0:
+        print(f"\n[BUILD] FAILED — exit code {result.returncode}")
+        return False
+
+    exe_path = os.path.join(output_dir, f"{exe_name}.exe")
+    if os.path.isfile(exe_path):
+        size_mb = os.path.getsize(exe_path) / (1024 * 1024)
+        print(f"\n[BUILD] Success!  {exe_path} ({size_mb:.1f} MB)")
+        return True
+    else:
+        print(f"\n[BUILD] Expected output not found: {exe_path}")
+        return False
+
+
 def main():
+    _make_console_utf8()
+    if "--build" in sys.argv:
+        sys.exit(0 if build_launcher() else 1)
+    if "--steam-selftest" in sys.argv:
+        sys.exit(_steam_selftest())
+    if "--steam-nettest" in sys.argv:
+        idx = sys.argv.index("--steam-nettest")
+        peer = 0
+        if idx + 1 < len(sys.argv) and sys.argv[idx + 1].isdigit():
+            peer = int(sys.argv[idx + 1])
+        seconds = 20.0
+        if "--seconds" in sys.argv:
+            si = sys.argv.index("--seconds")
+            if si + 1 < len(sys.argv):
+                try:
+                    seconds = max(3.0, float(sys.argv[si + 1]))
+                except ValueError:
+                    pass
+        sys.exit(_steam_nettest(duration=seconds, peer_id=peer))
     logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(message)s", datefmt="%H:%M:%S")
     host = _detect_local_host()
     port = RELAY_PORT
@@ -3299,6 +4988,10 @@ def main():
             print()
             print("GUI mode (default):")
             print("  python OutlastTogether.py")
+            print()
+            print("Steam smoke tests:")
+            print("  python OutlastTogether.py --steam-selftest            # Wave 0: init + identity")
+            print("  python OutlastTogether.py --steam-nettest [SteamID64]  # Wave 1: P2P transport")
             print()
             print("Master-server mode (run on VPS):")
             print("  python OutlastTogether.py --master-server [--ms-bind 0.0.0.0] [--ms-port 47778]")

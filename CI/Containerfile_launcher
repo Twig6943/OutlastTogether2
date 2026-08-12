@@ -47,6 +47,10 @@ RUN mkdir -p $WINEPREFIX $XDG_RUNTIME_DIR && \
     wineserver -w; \
     echo "PREFIX READY"
 
+# DEBUG
+RUN ls -l /usr/lib/libEGL.so.1 /usr/lib/libvulkan.so.1 &&
+ldconfig -p | grep -E 'lib(EGL|vulkan)\.so'
+
 # ---- Install Python + deps under cage (Wine uses Wayland driver) ----
 RUN wget -q https://www.python.org/ftp/python/3.12.9/python-3.12.9.exe && \
     wlheadless-run -c cage -- \

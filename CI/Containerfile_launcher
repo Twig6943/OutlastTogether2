@@ -14,7 +14,12 @@ ENV WINEPREFIX=/build/wine/prefix
 ENV WINEDEBUG=fixme-all
 ENV WINEDLLOVERRIDES="winemenubuilder.exe=d"
 ENV XDG_RUNTIME_DIR=/build/xdg
-ENV WLR_RENDERER=pixman
+# Wine's Wayland driver needs an EGL context from the compositor, which requires
+# cage to run with its GLES2 renderer and a real DRM render node. Without a GPU
+# node cage silently falls back to the pixman renderer (no EGL/wl_drm) and Wine
+# fails with "no driver could be loaded". Build with the host GPU exposed:
+#     podman build --device /dev/dri -t outlast-launcher -f CI/Containerfile_launcher .
+# Do NOT set LIBGL_ALWAYS_SOFTWARE here - it conflicts with the hardware device.
 
 # ---- Dependencies ----
 RUN dpkg --add-architecture i386 && \
@@ -22,6 +27,9 @@ RUN dpkg --add-architecture i386 && \
         sudo curl wget gnupg2 ca-certificates tar xz-utils unzip \
         cage xwayland-run \
         winbind lib32gcc-s1 lib32stdc++6 libc6-i386 \
+        libegl1 libegl1:i386 libgl1 libgl1:i386 libglx0 libglx0:i386 \
+        libgl1-mesa-dri libgl1-mesa-dri:i386 \
+        libvulkan1 libvulkan1:i386 mesa-vulkan-drivers mesa-vulkan-drivers:i386 \
     && rm -rf /var/lib/apt/lists/*
 
 # ---- WineHQ ----
@@ -47,21 +55,27 @@ RUN mkdir -p $WINEPREFIX $XDG_RUNTIME_DIR && \
     wineserver -w; \
     echo "PREFIX READY"
 
-# DEBUG
-RUN ls -l /usr/lib/libEGL.so.1 /usr/lib/libvulkan.so.1 &&
-ldconfig -p | grep -E 'lib(EGL|vulkan)\.so'
-
 # ---- Install Python + deps under cage (Wine uses Wayland driver) ----
+# The first process that triggers desktop creation races the explorer it
+# spawns: winewayland.drv is only loaded once explorer has set the desktop
+# window's "__wine_display_device_guid" prop, so the triggering process gets
+# "no driver could be loaded". Prime the desktop with a throwaway GUI run
+# (fails benignly but lets explorer finish setting up), then run the real
+# installer against the already-initialized desktop.
 RUN wget -q https://www.python.org/ftp/python/3.12.9/python-3.12.9.exe && \
     wlheadless-run -c cage -- \
-    wine python-3.12.9.exe /quiet \
-        InstallAllUsers=0 \
-        Include_launcher=0 \
-        Include_test=0 \
-        Include_symbols=0 \
-        Include_tcltk=1 \
-        PrependPath=1 \
-        TargetDir=C:\\Python312 && \
+    sh -c 'wine wineserver --persistent; \
+        wine C:\\windows\\system32\\notepad.exe 2>/dev/null; \
+        sleep 2; \
+        wine python-3.12.9.exe /quiet \
+            InstallAllUsers=0 \
+            Include_launcher=0 \
+            Include_test=0 \
+            Include_symbols=0 \
+            Include_tcltk=1 \
+            PrependPath=1 \
+            TargetDir=C:\\Python312; \
+        wineserver -k' && \
     rm -f python-3.12.9.exe && \
     wineserver -w && \
     echo "PYTHON INSTALLED"
@@ -74,12 +88,24 @@ RUN wlheadless-run -c cage -- \
     echo "PACKAGES INSTALLED"
 
 # ---- Build Windows binary with Nuitka under cage ----
+# Every gcc call runs under Wine (a full Wine process each), so disable LTO
+# and ccache (ccache adds a second Wine process per file and has no benefit
+# on a one-shot CI build) and give the step a generous timeout. `-u` keeps
+# Nuitka progress visible in the build log instead of looking hung.
 RUN wlheadless-run -c cage -- \
-    wine C:\\Python312\\python.exe -m nuitka \
-        --mingw64 \
-        --assume-yes-for-downloads \
-        --enable-plugin=tk-inter \
-        --onefile \
-        /build/OutlastTogether.py \
-        --output-filename=/build/OutlastLauncher.exe && \
+    sh -c 'wine wineserver --persistent; \
+        wine C:\\windows\\system32\\notepad.exe 2>/dev/null; \
+        sleep 2; \
+        timeout 3600 wine C:\\Python312\\python.exe -u -m nuitka \
+            --mingw64 \
+            --assume-yes-for-downloads \
+            --lto=no \
+            --disable-ccache \
+            --enable-plugin=tk-inter \
+            --onefile \
+            /build/OutlastTogether.py \
+            --output-filename=/build/OutlastLauncher.exe; \
+        NUITKA_EXIT=$?; \
+        wineserver -k; \
+        test $NUITKA_EXIT -eq 0' && \
     echo "BUILD SUCCESS"

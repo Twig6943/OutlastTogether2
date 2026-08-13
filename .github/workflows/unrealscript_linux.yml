@@ -17,7 +17,8 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Build container image
-        run: podman build -t outlast-unrealscript -f CI/Containerfile_unrealscript .
+        # Gpu somewhat needed
+        run: podman build --device /dev/dri -t outlast-unrealscript -f CI/Containerfile_unrealscript .
 
       - name: Extract binary from image
         run: |

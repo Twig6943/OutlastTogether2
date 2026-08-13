@@ -14,6 +14,7 @@ ENV WINEPREFIX=/build/wine/prefix
 ENV WINEDEBUG=fixme-all
 ENV WINEDLLOVERRIDES="winemenubuilder.exe=d"
 ENV XDG_RUNTIME_DIR=/build/xdg
+#ENV WLR_RENDERER=pixman # DO NOT UNCOMMENT THIS UNLESS YOU HAVE TO
 # Wine's Wayland driver needs an EGL context from the compositor, which requires
 # cage to run with its GLES2 renderer and a real DRM render node. Without a GPU
 # node cage silently falls back to the pixman renderer (no EGL/wl_drm) and Wine

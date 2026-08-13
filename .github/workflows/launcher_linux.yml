@@ -17,7 +17,11 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Build container image
-        run: podman build -t outlast-launcher -f CI/Containerfile_launcher .
+        # The Wayland build needs a real DRM render node for cage's GLES2
+        # renderer (see CI/Containerfile_launcher), so the runner must expose
+        # a GPU. Standard GitHub-hosted runners have no /dev/dri - use a
+        # self-hosted runner with a GPU for this workflow.
+        run: podman build --device /dev/dri -t outlast-launcher -f CI/Containerfile_launcher .
 
       - name: Extract binary from image
         run: |

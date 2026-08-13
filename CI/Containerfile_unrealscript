@@ -10,7 +10,7 @@ ENV WINEPREFIX=/build/wine/prefix
 ENV WINEDEBUG=fixme-all
 ENV WINEDLLOVERRIDES="winemenubuilder.exe=d"
 ENV XDG_RUNTIME_DIR=/build/xdg
-ENV WLR_RENDERER=pixman
+#ENV WLR_RENDERER=pixman # DO NOT UNCOMMENT THIS UNLESS YOU HAVE TO
 
 # ---- Dependencies ----
 RUN dpkg --add-architecture i386 && \
@@ -18,7 +18,9 @@ RUN dpkg --add-architecture i386 && \
         sudo curl wget gnupg2 ca-certificates tar xz-utils \
         cage xwayland-run \
         winbind lib32gcc-s1 lib32stdc++6 libc6-i386 git python3 python3-pip p7zip-full \
-        libegl1:i386 libegl-mesa0:i386 libgl1:i386 libgles2:i386 \
+        libegl1 libegl1:i386 libegl-mesa0:i386 libgl1 libgl1:i386 libglx0 libglx0:i386 libgles2:i386 \
+        libgl1-mesa-dri libgl1-mesa-dri:i386 \
+        libvulkan1 libvulkan1:i386 mesa-vulkan-drivers mesa-vulkan-drivers:i386 \
     && rm -rf /var/lib/apt/lists/*
 
 RUN pip install gdown --break-system-packages

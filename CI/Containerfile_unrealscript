@@ -63,8 +63,20 @@ RUN mkdir -p $WINEPREFIX $XDG_RUNTIME_DIR && \
     echo "PREFIX READY"
 
 # ---- Build under cage headless ----
+# The first process that triggers desktop creation races the explorer it
+# spawns: winewayland.drv is only loaded once explorer has set the desktop
+# window's "__wine_display_device_guid" prop, so the triggering process gets
+# "no driver could be loaded". Prime the desktop with a throwaway GUI run
+# (fails benignly but lets explorer finish setting up), then run the real
+# build against the already-initialized desktop.
 RUN wlheadless-run -c cage -- \
-        wine /build/Outlast-Level-Editor/Binaries/Win32/UDK.com make && \
+    sh -c 'wine wineserver --persistent; \
+        wine C:\\windows\\system32\\notepad.exe 2>/dev/null; \
+        sleep 2; \
+        timeout 3600 wine /build/Outlast-Level-Editor/Binaries/Win32/UDK.com make; \
+        UDK_EXIT=$?; \
+        wineserver -k; \
+        test $UDK_EXIT -eq 0' && \
     echo "BUILD SUCCESS"
 
 # Debug
